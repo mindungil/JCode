@@ -5,7 +5,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -60,6 +60,8 @@ class DeployRequest(BaseModel):
     student_num: str
     use_vnc: bool
     use_snapshot: bool
+    hw_count: int = Field(default=10, ge=10, le=15)
+    prac_count: int = Field(default=0, ge=0, le=10)
 
 class DeleteRequest(BaseModel):
     namespace: str
@@ -131,7 +133,7 @@ def load_incluster_config_or_fail():
 
 # # ---------------------------------
 
-def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool) -> str:
+def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool, hw_count: int = 10, prac_count: int = 0) -> str:
     init_volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
@@ -203,9 +205,12 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
             )
         )
     else:
-        base_cmd="\
+        hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
+        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 else ""
+        base_cmd = f"\
             chown -R 1000:1000 /home/coder/project && \
-            for i in $(seq 1 10); do mkdir -p /home/coder/project/hw$i && chown -R 1000:1000 /home/coder/project/hw$i; done && \
+            {hw_cmd}{prac_cmd} && \
+            chown -R 1000:1000 /home/coder/project && \
             chown -R 1000:1000 /home/coder/.local"
         volume_mount=client.V1VolumeMount(
             name="jcode-vol",
@@ -397,7 +402,9 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
             request.file_path,
             request.student_num,
             request.use_vnc,
-            request.use_snapshot
+            request.use_snapshot,
+            request.hw_count,
+            request.prac_count
         )
         service_msg = create_service(
             core_v1_api,
