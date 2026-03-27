@@ -173,7 +173,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
     ]
 
     # 기본 code-server 이미지
-    image_name = "code-server:test"
+    image_name = os.getenv("CODE_SERVER_IMAGE", "code-server:test")
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분
     if use_snapshot:
@@ -233,7 +233,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
 
     # VNC를 사용할 경우 추가 설정
     if use_vnc:
-        image_name = "code-server-vnc:test"
+        image_name = os.getenv("CODE_SERVER_VNC_IMAGE", "code-server-vnc:test")
 
         container_ports.append(client.V1ContainerPort(container_port=5901))  # VNC 포트 추가
         container_ports.append(client.V1ContainerPort(container_port=6080))  # noVNC 포트 추가
@@ -261,7 +261,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                         client.V1Container(
                             name="code-server",
                             image=image_name,
-                            image_pull_policy="IfNotPresent",
+                            image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
                             ports=container_ports,  # 동적으로 생성된 containerPort 리스트 적용
                             env=[
                                 client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
