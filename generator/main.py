@@ -447,7 +447,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
             namespace=namespace
         ),
         subjects=[
-            client.V1Subject(
+            client.RbacV1Subject(
                 kind="ServiceAccount",
                 name=GENERATOR_SA_NAME,
                 namespace=GENERATOR_SA_NAMESPACE
