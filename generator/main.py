@@ -366,6 +366,8 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
 
 GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-generator")
 GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
+NS_ROLE_LABEL = os.getenv("NS_ROLE_LABEL", "jcode")
+WATCHER_NAMESPACE = os.getenv("WATCHER_NAMESPACE", "watcher")
 
 def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, namespace: str):
     """jcode-init.sh와 동일한 7개 리소스를 생성하여 NS를 초기화합니다."""
@@ -374,7 +376,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
     ns_body = client.V1Namespace(
         metadata=client.V1ObjectMeta(
             name=namespace,
-            labels={"role": "jcode"}
+            labels={"role": NS_ROLE_LABEL}
         )
     )
     try:
@@ -525,12 +527,12 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
                     _from=[
                         client.V1NetworkPolicyPeer(
                             namespace_selector=client.V1LabelSelector(
-                                match_labels={"role": "jcode"}
+                                match_labels={"role": NS_ROLE_LABEL}
                             )
                         ),
                         client.V1NetworkPolicyPeer(
                             namespace_selector=client.V1LabelSelector(
-                                match_labels={"kubernetes.io/metadata.name": "watcher"}
+                                match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
                             )
                         ),
                         client.V1NetworkPolicyPeer(
