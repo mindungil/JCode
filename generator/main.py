@@ -36,9 +36,11 @@ app = FastAPI()
 instrumentator = Instrumentator()
 instrumentator.instrument(app).expose(app, include_in_schema=False, endpoint="/metrics")
 
-# 환경 변수에서 JWT 관련 값 로드
-SECRET_KEY = os.getenv("SECRET_KEY", "secret_key")
-ALGORITHM = os.getenv("ALGORITHM", "alg")
+# 환경 변수에서 JWT 관련 값 로드 (미설정 시 기동 차단)
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM")
+if not SECRET_KEY or not ALGORITHM:
+    raise RuntimeError("SECRET_KEY, ALGORITHM 환경 변수가 반드시 설정되어야 합니다.")
 
 # NFS 서버 정보: 환경 변수로부터 로드
 NFS_SERVER = os.getenv("NFS_SERVER", "nfs_server")
