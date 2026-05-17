@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 import requests
@@ -364,6 +365,16 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
     
 ################ Namespace 관리 함수 ##################
 
+ALLOWED_NS_PATTERN = re.compile(r"^jcode-[a-z0-9]+-\d+$")
+PROTECTED_NAMESPACES = {"default", "kube-system", "kube-public", "kube-node-lease", "ingress-nginx", "monitoring", "watcher"}
+
+def validate_namespace(ns: str):
+    """jcode-{code}-{clss} 패턴만 허용하고, 시스템 NS 조작을 차단합니다."""
+    if ns in PROTECTED_NAMESPACES:
+        raise HTTPException(status_code=403, detail=f"시스템 네임스페이스 '{ns}'�� 조작할 수 없습니다.")
+    if not ALLOWED_NS_PATTERN.match(ns):
+        raise HTTPException(status_code=400, detail=f"네임스��이스 이름이 허용된 패턴(jcode-{{code}}-{{clss}})과 일���하지 않습니다: '{ns}'")
+
 GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-generator")
 GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
 NS_ROLE_LABEL = os.getenv("NS_ROLE_LABEL", "jcode")
@@ -598,10 +609,12 @@ def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
 @app.post("/api/namespace")
 async def create_namespace_api(request: NamespaceRequest, token_payload: dict = Depends(verify_token)):
     """NS 초기화: Namespace + SA + Role + RoleBinding + ConfigMap + LimitRange + NetworkPolicy"""
+    validate_namespace(request.namespace)
+
     try:
         load_incluster_config_or_fail()
     except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
+        logger.exception("인클러스터 구성 로딩 ��패:")
         raise HTTPException(status_code=500, detail=str(e))
 
     core_v1_api = client.CoreV1Api()
@@ -620,6 +633,8 @@ async def create_namespace_api(request: NamespaceRequest, token_payload: dict = 
 @app.delete("/api/namespace/{ns}")
 async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_token)):
     """NS 삭제: 네임스페이스와 내부 모든 리소스를 삭제합니다."""
+    validate_namespace(ns)
+
     try:
         load_incluster_config_or_fail()
     except Exception as e:
@@ -645,6 +660,8 @@ async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_tok
 @app.delete("/api/namespace/{ns}/resources")
 async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(verify_token)):
     """NS 내 전체 Deployment/Service/Pod 삭제 (NS 자체는 유지)."""
+    validate_namespace(ns)
+
     try:
         load_incluster_config_or_fail()
     except Exception as e:
@@ -669,6 +686,8 @@ async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(
 
 @app.post("/api/jcode")
 async def deploy_resources(request: DeployRequest, token_payload: dict = Depends(verify_token)):
+    validate_namespace(request.namespace)
+
     try:
         load_incluster_config_or_fail()
     except Exception as e:
@@ -722,6 +741,8 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
     
 @app.delete("/api/jcode")
 async def delete_resources(request: DeleteRequest, token_payload: dict = Depends(verify_token)):
+    validate_namespace(request.namespace)
+
     try:
         load_incluster_config_or_fail()
     except Exception as e:
