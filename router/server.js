@@ -414,6 +414,19 @@ server.on('upgrade', async (req, socket, head) => {
       return;
     }
     const { courseCode, clss, email, snapshot } = userProfile;
+
+    // 권한 체크: GET /jcode와 동일한 로직 적용
+    const decoded = jwt.decode(token);
+    const { sub, role } = decoded;
+    if (!role || role !== "ADMIN") {
+      const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
+      if (!isManager && sub !== email) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\nNo permission for this project');
+        socket.destroy();
+        return;
+      }
+    }
+
     const redisKeyForTarget = (snapshot === 'true' || snapshot === true)
       ? `user:${email}:course:${courseCode}:${clss}:snapshot`
       : `user:${email}:course:${courseCode}:${clss}`;
