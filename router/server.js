@@ -45,9 +45,13 @@ app.use((req, res, next) => {
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
-// JWT 정보
-const JWT_SECRET = process.env.JWT_SECRET || "ACCESS_SECRET";
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "REFRESH_SECRET";
+// JWT 정보 (미설정 시 기동 차단)
+if (!process.env.JWT_SECRET || !process.env.JWT_REFRESH_SECRET) {
+  console.error("FATAL: JWT_SECRET, JWT_REFRESH_SECRET 환경 변수가 반드시 설정되어야 합니다.");
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 
 // token refresh 엔드포인트
 const SPRING_REFRESH_URL = process.env.SPRING_REFRESH_URL || "SPRING_REFRESH_URL";
