@@ -245,7 +245,7 @@ app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res, n
     console.log(`course: ${courseCode}:${clss}, studentEmail: ${studentEmail}, email: ${sub}, role: ${role}`);
     
     // 권한 체크: ADMIN이 아닌 모든 유저는 Redis courseManagerList 또는 본인 이메일로 확인
-    if (!role || !role.includes("ADMIN")) {
+    if (!role || role !== "ADMIN") {
       const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
       if (!isManager && sub !== studentEmail) {
         return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
@@ -418,6 +418,19 @@ server.on('upgrade', async (req, socket, head) => {
       return;
     }
     const { courseCode, clss, email, snapshot } = userProfile;
+
+    // 권한 체크: GET /jcode와 동일한 로직 적용
+    const decoded = jwt.decode(token);
+    const { sub, role } = decoded;
+    if (!role || role !== "ADMIN") {
+      const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
+      if (!isManager && sub !== email) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\nNo permission for this project');
+        socket.destroy();
+        return;
+      }
+    }
+
     const redisKeyForTarget = (snapshot === 'true' || snapshot === true)
       ? `user:${email}:course:${courseCode}:${clss}:snapshot`
       : `user:${email}:course:${courseCode}:${clss}`;
