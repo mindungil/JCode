@@ -102,6 +102,9 @@ def load_incluster_config_or_fail():
     except Exception as e:
         logger.exception("인클러스터 구성 로딩 실패:")
         raise Exception("인클러스터 구성이 불가능합니다. 이 API는 인클러스터 환경에서만 실행됩니다.")
+
+# 기동 시 1회 인클러스터 설정 로드
+load_incluster_config_or_fail()
     
 # # --- Prometheus API 모니터링 메트릭 ---
 # http_requests_total = Counter(
@@ -598,12 +601,6 @@ def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
 @app.post("/api/namespace")
 async def create_namespace_api(request: NamespaceRequest, token_payload: dict = Depends(verify_token)):
     """NS 초기화: Namespace + SA + Role + RoleBinding + ConfigMap + LimitRange + NetworkPolicy"""
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
-
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
     rbac_v1_api = client.RbacAuthorizationV1Api()
@@ -620,12 +617,6 @@ async def create_namespace_api(request: NamespaceRequest, token_payload: dict = 
 @app.delete("/api/namespace/{ns}")
 async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_token)):
     """NS 삭제: 네임스페이스와 내부 모든 리소스를 삭제합니다."""
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
-
     core_v1_api = client.CoreV1Api()
 
     try:
@@ -645,12 +636,6 @@ async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_tok
 @app.delete("/api/namespace/{ns}/resources")
 async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(verify_token)):
     """NS 내 전체 Deployment/Service/Pod 삭제 (NS 자체는 유지)."""
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
-
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
@@ -669,12 +654,6 @@ async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(
 
 @app.post("/api/jcode")
 async def deploy_resources(request: DeployRequest, token_payload: dict = Depends(verify_token)):
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
-
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
@@ -722,12 +701,6 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
     
 @app.delete("/api/jcode")
 async def delete_resources(request: DeleteRequest, token_payload: dict = Depends(verify_token)):
-    try:
-        load_incluster_config_or_fail()
-    except Exception as e:
-        logger.exception("인클러스터 구성 로딩 실패:")
-        raise HTTPException(status_code=500, detail=str(e))
-    
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
