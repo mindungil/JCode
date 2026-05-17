@@ -241,7 +241,7 @@ app.get('/jcode', ensureAuthenticated, verifyTokenFromCookie, async (req, res, n
     console.log(`course: ${courseCode}:${clss}, studentEmail: ${studentEmail}, email: ${sub}, role: ${role}`);
     
     // 권한 체크: ADMIN이 아닌 모든 유저는 Redis courseManagerList 또는 본인 이메일로 확인
-    if (!role || !role.includes("ADMIN")) {
+    if (!role || role !== "ADMIN") {
       const isManager = await redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
       if (!isManager && sub !== studentEmail) {
         return closeWindowWithMessage(res, 403, "해당 프로젝트에 접근 권한이 없습니다.");
