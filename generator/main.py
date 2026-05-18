@@ -63,8 +63,9 @@ class DeployRequest(BaseModel):
     student_num: str
     use_vnc: bool
     use_snapshot: bool
-    hw_count: int = Field(default=10, ge=10, le=15)
+    hw_count: int = Field(default=10, ge=0, le=100)
     prac_count: int = Field(default=0, ge=0, le=10)
+    assignment_dirs: list[str] = Field(default=[])
 
 class DeleteRequest(BaseModel):
     namespace: str
@@ -73,6 +74,10 @@ class DeleteRequest(BaseModel):
 
 class NamespaceRequest(BaseModel):
     namespace: str
+
+class ProvisionRequest(BaseModel):
+    namespace: str
+    dir_name: str
 
 # HTTP Bearer 인증 사용
 security = HTTPBearer()
@@ -142,7 +147,7 @@ load_incluster_config_or_fail()
 
 # # ---------------------------------
 
-def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool, hw_count: int = 10, prac_count: int = 0) -> str:
+def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_label: str, file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool, hw_count: int = 10, prac_count: int = 0, assignment_dirs: list = None) -> str:
     init_volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
@@ -214,8 +219,12 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
             )
         )
     else:
-        hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
-        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 else ""
+        if assignment_dirs:
+            dirs = " ".join(f'"/home/coder/project/{d}"' for d in assignment_dirs)
+            hw_cmd = f"mkdir -p {dirs}"
+        else:
+            hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
+        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 and not assignment_dirs else ""
         base_cmd = f"\
             chown -R 1000:1000 /home/coder/project && \
             {hw_cmd}{prac_cmd} && \
@@ -702,7 +711,8 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
             request.use_vnc,
             request.use_snapshot,
             request.hw_count,
-            request.prac_count
+            request.prac_count,
+            request.assignment_dirs
         )
         service_msg = create_service(
             core_v1_api,
@@ -755,6 +765,34 @@ async def delete_resources(request: DeleteRequest, token_payload: dict = Depends
     except Exception as e:
         logger.exception("리소스 삭제 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/workspace/provision")
+async def provision_workspace(request: ProvisionRequest, token_payload: dict = Depends(verify_token)):
+    """과제 생성 시 호출: 해당 과목의 모든 학생 NFS 워크스페이스에 디렉토리 생성"""
+    validate_namespace(request.namespace)
+
+    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
+    class_div = request.namespace.replace("jcode-", "", 1)
+
+    base_path = os.path.join(nfs_mount_path, "workspace")
+    if not os.path.isdir(base_path):
+        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+
+    import glob
+    student_dirs = glob.glob(os.path.join(base_path, f"{class_div}-*"))
+
+    created = 0
+    for student_dir in student_dirs:
+        if not os.path.isdir(student_dir):
+            continue
+        hw_dir = os.path.join(student_dir, request.dir_name)
+        os.makedirs(hw_dir, exist_ok=True)
+        os.chown(hw_dir, 1000, 1000)
+        created += 1
+
+    logger.info(f"Provisioned '{request.dir_name}' in {created} student directories for {class_div}")
+    return {"created": created, "dir_name": request.dir_name}
+
 
 if __name__ == "__main__":
     import uvicorn
