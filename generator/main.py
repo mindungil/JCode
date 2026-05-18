@@ -3,7 +3,7 @@ import re
 import time
 import logging
 import requests
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Form, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -792,6 +792,62 @@ async def provision_workspace(request: ProvisionRequest, token_payload: dict = D
 
     logger.info(f"Provisioned '{request.dir_name}' in {created} student directories for {class_div}")
     return {"created": created, "dir_name": request.dir_name}
+
+
+@app.post("/api/workspace/starter-code")
+async def deploy_starter_code(
+    namespace: str = Form(...),
+    dir_name: str = Form(...),
+    file: UploadFile = File(...),
+    token_payload: dict = Depends(verify_token)
+):
+    """스타터 코드 zip 파일을 모든 학생 워크스페이스에 배포"""
+    validate_namespace(namespace)
+
+    import glob
+    import zipfile
+    import tempfile
+    import shutil
+
+    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
+    class_div = namespace.replace("jcode-", "", 1)
+    base_path = os.path.join(nfs_mount_path, "workspace")
+
+    if not os.path.isdir(base_path):
+        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+
+    # zip 파일을 임시 디렉토리에 저장
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        student_dirs = glob.glob(os.path.join(base_path, f"{class_div}-*"))
+        deployed = 0
+
+        for student_dir in student_dirs:
+            if not os.path.isdir(student_dir):
+                continue
+            target_dir = os.path.join(student_dir, dir_name)
+            os.makedirs(target_dir, exist_ok=True)
+
+            # zip 압축 해제
+            with zipfile.ZipFile(tmp_path, 'r') as zf:
+                zf.extractall(target_dir)
+
+            # 소유권 설정
+            for root, dirs, files in os.walk(target_dir):
+                os.chown(root, 1000, 1000)
+                for f in files:
+                    os.chown(os.path.join(root, f), 1000, 1000)
+
+            deployed += 1
+
+        logger.info(f"Deployed starter code to {deployed} directories for {class_div}/{dir_name}")
+        return {"deployed": deployed, "dir_name": dir_name}
+    finally:
+        os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
