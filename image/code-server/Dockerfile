@@ -26,6 +26,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 # 필요 시 포트 노출 (code-server 기본 포트)
 EXPOSE 8080
 
+# 워크스페이스 제한 쉘 스크립트 복사
+COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
+RUN chmod 644 /etc/profile.d/restricted-shell.sh
+
 # 기본 사용자로 전환 (code-server 이미지는 기본적으로 'coder' 사용자를 사용)
 USER coder
 
