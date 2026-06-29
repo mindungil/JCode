@@ -34,7 +34,7 @@ rules:
   verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["create", "get", "list", "watch"]
   
 ---
 # 4. RoleBinding 생성: 위 Role을 서비스 어카운트에 바인딩

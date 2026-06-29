@@ -5,6 +5,7 @@ import stat
 import time
 import logging
 import requests
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Form, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
@@ -80,6 +81,40 @@ class NamespaceRequest(BaseModel):
 class ProvisionRequest(BaseModel):
     namespace: str
     dir_name: str
+
+
+def parse_csv_env(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def get_image_pull_secret_names() -> list[str]:
+    names = parse_csv_env("IMAGE_PULL_SECRET_NAMES")
+    legacy_name = os.getenv("IMAGE_PULL_SECRET_NAME", "").strip()
+    if legacy_name:
+        names.append(legacy_name)
+    return list(dict.fromkeys(names))
+
+
+def get_optional_args(name: str) -> Optional[list[str]]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return shlex.split(value)
+
+
+def get_code_server_args(use_vnc: bool) -> Optional[list[str]]:
+    if use_vnc:
+        return get_optional_args("CODE_SERVER_VNC_ARGS") or get_optional_args("CODE_SERVER_ARGS")
+    return get_optional_args("CODE_SERVER_ARGS")
+
+
+def get_code_server_extra_env() -> list[client.V1EnvVar]:
+    env = []
+    workspace_root = os.getenv("WORKSPACE_ROOT", "").strip()
+    if workspace_root:
+        env.append(client.V1EnvVar(name="WORKSPACE_ROOT", value=workspace_root))
+    return env
 
 
 def validate_workspace_dir_name(dir_name: str) -> str:
@@ -317,6 +352,18 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
         container_ports.append(client.V1ContainerPort(container_port=5901))  # VNC 포트 추가
         container_ports.append(client.V1ContainerPort(container_port=6080))  # noVNC 포트 추가
 
+    image_pull_secret_names = get_image_pull_secret_names()
+    image_pull_secrets = [
+        client.V1LocalObjectReference(name=name)
+        for name in image_pull_secret_names
+    ] or None
+    code_server_args = get_code_server_args(use_vnc)
+    code_server_env = [
+        client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
+        client.V1EnvVar(name="AUTH", value="none"),
+        client.V1EnvVar(name="DISPLAY", value=":1")  # VNC Display 설정
+    ] + get_code_server_extra_env()
+
     deployment = client.V1Deployment(
         api_version="apps/v1",
         kind="Deployment",
@@ -328,6 +375,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                 metadata=client.V1ObjectMeta(labels={"app": app_label}),
                 spec=client.V1PodSpec(
                     service_account_name=SERVICE_ACCOUNT,
+                    image_pull_secrets=image_pull_secrets,
                     init_containers=[
                         client.V1Container(
                             name="fix-permissions",
@@ -341,12 +389,9 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                             name="code-server",
                             image=image_name,
                             image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
+                            args=code_server_args,
                             ports=container_ports,  # 동적으로 생성된 containerPort 리스트 적용
-                            env=[
-                                client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
-                                client.V1EnvVar(name="AUTH", value="none"),
-                                client.V1EnvVar(name="DISPLAY", value=":1")  # VNC Display 설정
-                            ],
+                            env=code_server_env,
                             resources=client.V1ResourceRequirements(
                                 requests={"cpu": "200m", "memory": "256Mi"},
                                 limits={"cpu": "4", "memory": "2Gi"}
@@ -450,6 +495,47 @@ GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
 NS_ROLE_LABEL = os.getenv("NS_ROLE_LABEL", "jcode")
 WATCHER_NAMESPACE = os.getenv("WATCHER_NAMESPACE", "watcher")
 
+
+def ensure_image_pull_secrets(core_v1_api, namespace: str):
+    """Optionally copy registry pull secrets into a course namespace."""
+    source_namespace = os.getenv("IMAGE_PULL_SECRET_SOURCE_NAMESPACE", GENERATOR_SA_NAMESPACE)
+    for secret_name in get_image_pull_secret_names():
+        try:
+            core_v1_api.read_namespaced_secret(name=secret_name, namespace=namespace)
+            logger.info(f"ImagePullSecret '{secret_name}' already exists in namespace '{namespace}'.")
+            continue
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        try:
+            source_secret = core_v1_api.read_namespaced_secret(
+                name=secret_name,
+                namespace=source_namespace
+            )
+        except ApiException as e:
+            if e.status == 404:
+                logger.warning(
+                    f"ImagePullSecret '{secret_name}' not found in source namespace "
+                    f"'{source_namespace}'. Skipping copy for namespace '{namespace}'."
+                )
+                continue
+            raise
+
+        secret_body = client.V1Secret(
+            metadata=client.V1ObjectMeta(name=secret_name, namespace=namespace),
+            data=source_secret.data,
+            type=source_secret.type
+        )
+        try:
+            core_v1_api.create_namespaced_secret(namespace=namespace, body=secret_body)
+            logger.info(f"ImagePullSecret '{secret_name}' copied to namespace '{namespace}'.")
+        except ApiException as e:
+            if e.status == 409:
+                logger.info(f"ImagePullSecret '{secret_name}' already exists in namespace '{namespace}'.")
+            else:
+                raise
+
 def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, namespace: str):
     """jcode-init.sh와 동일한 7개 리소스를 생성하여 NS를 초기화합니다."""
 
@@ -510,7 +596,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
             client.V1PolicyRule(
                 api_groups=[""],
                 resources=["secrets"],
-                verbs=["get", "list", "watch"]
+                verbs=["create", "get", "list", "watch"]
             ),
         ]
     )
@@ -640,6 +726,9 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
             logger.info(f"NetworkPolicy 'watcher-networkpolicy'가 이미 존재합니다.")
         else:
             raise
+
+    # 8. Optional ImagePullSecret copy for registry fallback.
+    ensure_image_pull_secrets(core_v1_api, namespace)
 
 
 def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
