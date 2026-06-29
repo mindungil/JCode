@@ -1,5 +1,7 @@
 import os
 import re
+import shlex
+import stat
 import time
 import logging
 import requests
@@ -78,6 +80,59 @@ class NamespaceRequest(BaseModel):
 class ProvisionRequest(BaseModel):
     namespace: str
     dir_name: str
+
+
+def validate_workspace_dir_name(dir_name: str) -> str:
+    cleaned = dir_name.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="dir_name은 비어 있을 수 없습니다.")
+    if len(cleaned) > 80:
+        raise HTTPException(status_code=400, detail="dir_name은 80자를 초과할 수 없습니다.")
+    if os.path.isabs(cleaned) or "/" in cleaned or "\\" in cleaned:
+        raise HTTPException(status_code=400, detail="dir_name에는 경로 구분자를 사용할 수 없습니다.")
+    if cleaned in {".", ".."} or any(part == ".." for part in cleaned.split(os.path.sep)):
+        raise HTTPException(status_code=400, detail="dir_name에는 상위 경로 참조를 사용할 수 없습니다.")
+    if re.search(r'[:*?"<>|]', cleaned):
+        raise HTTPException(status_code=400, detail='dir_name에는 : * ? " < > | 문자를 사용할 수 없습니다.')
+    return cleaned
+
+
+def validate_zip_member(info, target_dir: str):
+    raw_name = info.filename
+    normalized = os.path.normpath(raw_name)
+
+    if not raw_name or normalized in {"", "."}:
+        raise HTTPException(status_code=400, detail="zip 파일에 유효하지 않은 경로가 포함되어 있습니다.")
+    if os.path.isabs(raw_name) or normalized.startswith("..") or f"{os.path.sep}.." in normalized:
+        raise HTTPException(status_code=400, detail=f"zip 파일에 상위 경로 참조가 포함되어 있습니다: {raw_name}")
+
+    mode = (info.external_attr >> 16) & 0o777777
+    if stat.S_ISLNK(mode):
+        raise HTTPException(status_code=400, detail=f"zip 파일에 symlink가 포함되어 있습니다: {raw_name}")
+
+    target_root = os.path.realpath(target_dir)
+    target_path = os.path.realpath(os.path.join(target_dir, normalized))
+    if target_path != target_root and not target_path.startswith(target_root + os.sep):
+        raise HTTPException(status_code=400, detail=f"zip 파일 경로가 대상 디렉토리를 벗어납니다: {raw_name}")
+
+
+def safe_extract_zip(zip_file, target_dir: str):
+    max_files = int(os.getenv("STARTER_ZIP_MAX_FILES", "1000"))
+    max_uncompressed = int(os.getenv("STARTER_ZIP_MAX_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
+
+    infos = zip_file.infolist()
+    if len(infos) > max_files:
+        raise HTTPException(status_code=400, detail=f"zip 파일 항목 수가 너무 많습니다: {len(infos)}")
+
+    total_size = 0
+    for info in infos:
+        validate_zip_member(info, target_dir)
+        total_size += info.file_size
+        if total_size > max_uncompressed:
+            raise HTTPException(status_code=400, detail="zip 파일 압축 해제 크기가 허용치를 초과합니다.")
+
+    for info in infos:
+        zip_file.extract(info, target_dir)
 
 # HTTP Bearer 인증 사용
 security = HTTPBearer()
@@ -220,7 +275,8 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
         )
     else:
         if assignment_dirs:
-            dirs = " ".join(f'"/home/coder/project/{d}"' for d in assignment_dirs)
+            safe_dirs = [validate_workspace_dir_name(d) for d in assignment_dirs]
+            dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
             hw_cmd = f"mkdir -p {dirs}"
         else:
             hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
@@ -770,6 +826,7 @@ async def delete_resources(request: DeleteRequest, token_payload: dict = Depends
 async def provision_workspace(request: ProvisionRequest, token_payload: dict = Depends(verify_token)):
     """과제 생성 시 호출: 해당 과목의 모든 학생 NFS 워크스페이스에 디렉토리 생성"""
     validate_namespace(request.namespace)
+    dir_name = validate_workspace_dir_name(request.dir_name)
 
     nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
     class_div = request.namespace.replace("jcode-", "", 1)
@@ -785,13 +842,13 @@ async def provision_workspace(request: ProvisionRequest, token_payload: dict = D
     for student_dir in student_dirs:
         if not os.path.isdir(student_dir):
             continue
-        hw_dir = os.path.join(student_dir, request.dir_name)
+        hw_dir = os.path.join(student_dir, dir_name)
         os.makedirs(hw_dir, exist_ok=True)
         os.chown(hw_dir, 1000, 1000)
         created += 1
 
-    logger.info(f"Provisioned '{request.dir_name}' in {created} student directories for {class_div}")
-    return {"created": created, "dir_name": request.dir_name}
+    logger.info(f"Provisioned '{dir_name}' in {created} student directories for {class_div}")
+    return {"created": created, "dir_name": dir_name}
 
 
 @app.post("/api/workspace/starter-code")
@@ -803,6 +860,7 @@ async def deploy_starter_code(
 ):
     """스타터 코드 zip 파일을 모든 학생 워크스페이스에 배포"""
     validate_namespace(namespace)
+    dir_name = validate_workspace_dir_name(dir_name)
 
     import glob
     import zipfile
@@ -816,9 +874,13 @@ async def deploy_starter_code(
     if not os.path.isdir(base_path):
         raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
 
+    content = await file.read()
+    max_zip_bytes = int(os.getenv("STARTER_ZIP_MAX_BYTES", str(50 * 1024 * 1024)))
+    if len(content) > max_zip_bytes:
+        raise HTTPException(status_code=400, detail="zip 파일 크기가 허용치를 초과합니다.")
+
     # zip 파일을 임시 디렉토리에 저장
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-        content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
@@ -834,7 +896,7 @@ async def deploy_starter_code(
 
             # zip 압축 해제
             with zipfile.ZipFile(tmp_path, 'r') as zf:
-                zf.extractall(target_dir)
+                safe_extract_zip(zf, target_dir)
 
             # 소유권 설정
             for root, dirs, files in os.walk(target_dir):
