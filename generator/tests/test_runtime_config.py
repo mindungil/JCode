@@ -51,35 +51,55 @@ def test_workspace_root_rejects_prefix_collision(generator, monkeypatch):
         generator.get_workspace_root()
 
 
-def test_ensure_image_pull_secrets_requires_preprovisioned_secret(generator, monkeypatch):
+def test_wait_for_external_secret_uses_ready_condition(generator, monkeypatch):
     monkeypatch.setenv("IMAGE_PULL_SECRET_NAMES", "harbor-jcode-pull")
-    monkeypatch.setenv("IMAGE_PULL_SECRET_SOURCE_NAMESPACE", "watcher")
 
-    class CoreV1:
-        def read_namespaced_secret(self, name, namespace):
-            return generator.client.V1Secret(
-                metadata=generator.client.V1ObjectMeta(name=name),
-                data={".dockerconfigjson": "encoded"},
-                type="kubernetes.io/dockerconfigjson",
-            )
+    class CustomObjects:
+        def get_namespaced_custom_object(self, **kwargs):
+            return {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
 
-    core_v1 = CoreV1()
-    generator.ensure_image_pull_secrets(core_v1, "jcode-course-1")
+    generator.wait_for_external_image_pull_secrets(CustomObjects(), "jcode-course-1")
 
 
-def test_ensure_image_pull_secrets_fails_when_not_configured(generator, monkeypatch):
+def test_wait_for_external_secret_fails_when_not_configured(generator, monkeypatch):
     monkeypatch.delenv("IMAGE_PULL_SECRET_NAMES", raising=False)
     monkeypatch.delenv("IMAGE_PULL_SECRET_NAME", raising=False)
 
-    class CoreV1:
-        def read_namespaced_secret(self, name, namespace):
-            raise AssertionError("secret API should not be called")
-
-        def create_namespaced_secret(self, namespace, body):
-            raise AssertionError("secret API should not be called")
-
     with pytest.raises(RuntimeError):
-        generator.ensure_image_pull_secrets(CoreV1(), "jcode-course-1")
+        generator.wait_for_external_image_pull_secrets(object(), "jcode-course-1")
+
+
+def test_external_secret_is_created_without_reading_secret_material(generator, monkeypatch):
+    monkeypatch.setenv("IMAGE_PULL_SECRET_NAMES", "harbor-jcode-pull")
+    monkeypatch.setenv("IMAGE_PULL_SECRET_REMOTE_NAMES", "watcher-harbor-registry-secret")
+    monkeypatch.setattr(generator, "EXTERNAL_SECRET_STORE_NAME", "jcode-harbor-pull-secret")
+
+    class CustomObjects:
+        def __init__(self):
+            self.created = None
+
+        def get_namespaced_custom_object(self, **kwargs):
+            raise generator.ApiException(status=404)
+
+        def create_namespaced_custom_object(self, **kwargs):
+            self.created = kwargs["body"]
+
+    custom_objects = CustomObjects()
+    generator.ensure_external_image_pull_secrets(custom_objects, "jcode-course-1")
+
+    assert custom_objects.created["spec"]["target"]["name"] == "harbor-jcode-pull"
+    assert custom_objects.created["spec"]["dataFrom"][0]["extract"]["key"] == "watcher-harbor-registry-secret"
+    assert "data" not in custom_objects.created
+
+
+def test_workspace_proxy_environment_contains_upper_and_lowercase(generator, monkeypatch):
+    monkeypatch.setattr(generator, "WORKSPACE_PROXY_URL", "http://proxy.watcher.svc:3000")
+
+    values = {item.name: item.value for item in generator.get_workspace_proxy_env()}
+
+    assert values["HTTP_PROXY"] == "http://proxy.watcher.svc:3000"
+    assert values["https_proxy"] == "http://proxy.watcher.svc:3000"
+    assert ".svc" in values["NO_PROXY"]
 
 
 def test_watcher_hook_config_is_created_and_contains_dynamic_assignment_lookup(generator):

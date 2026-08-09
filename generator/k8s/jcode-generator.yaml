@@ -22,6 +22,8 @@ spec:
         app: jcode-generator
     spec:
       serviceAccountName: jcode-workspace
+      imagePullSecrets:
+      - name: watcher-harbor-registry-secret
       containers:
       - name: jcode-generator
         image: jcode-generator:test

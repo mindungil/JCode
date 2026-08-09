@@ -45,10 +45,6 @@ rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["create", "get", "list", "watch", "update", "patch"]
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get"]
-  
 ---
 # 4. RoleBinding 생성: 위 Role을 서비스 어카운트에 바인딩
 apiVersion: rbac.authorization.k8s.io/v1

@@ -62,6 +62,20 @@ SNAPSHOT_NFS_PATH = os.getenv("SNAPSHOT_NFS_PATH", "")
 # 서비스 어카운트 고정 (또는 환경 변수로부터 로드)
 SERVICE_ACCOUNT = os.getenv("SERVICE_ACCOUNT", "jcode-workload")
 
+WORKSPACE_PROXY_URL = os.getenv("WORKSPACE_PROXY_URL", "").strip()
+WORKSPACE_PROXY_NAMESPACE = os.getenv("WORKSPACE_PROXY_NAMESPACE", "").strip()
+WORKSPACE_PROXY_POD_LABEL = os.getenv("WORKSPACE_PROXY_POD_LABEL", "").strip()
+WORKSPACE_PROXY_PORT = int(os.getenv("WORKSPACE_PROXY_PORT", "3000"))
+WORKSPACE_NO_PROXY = os.getenv(
+    "WORKSPACE_NO_PROXY",
+    "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local",
+).strip()
+
+EXTERNAL_SECRET_STORE_NAME = os.getenv("EXTERNAL_SECRET_STORE_NAME", "").strip()
+EXTERNAL_SECRET_STORE_KIND = os.getenv("EXTERNAL_SECRET_STORE_KIND", "ClusterSecretStore").strip()
+EXTERNAL_SECRET_REFRESH_INTERVAL = os.getenv("EXTERNAL_SECRET_REFRESH_INTERVAL", "1h").strip()
+IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS = int(os.getenv("IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS", "60"))
+
 # 요청 바디 모델 정의
 class DeployRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -105,6 +119,28 @@ def get_image_pull_secret_names() -> list[str]:
     if legacy_name:
         names.append(legacy_name)
     return list(dict.fromkeys(names))
+
+
+def get_image_pull_secret_remote_names() -> list[str]:
+    targets = get_image_pull_secret_names()
+    configured = parse_csv_env("IMAGE_PULL_SECRET_REMOTE_NAMES")
+    if not configured:
+        return targets
+    if len(configured) != len(targets):
+        raise RuntimeError("IMAGE_PULL_SECRET_REMOTE_NAMES 수는 IMAGE_PULL_SECRET_NAMES와 같아야 합니다.")
+    return configured
+
+
+def get_workspace_proxy_env() -> list[client.V1EnvVar]:
+    values = {
+        "HTTP_PROXY": WORKSPACE_PROXY_URL,
+        "HTTPS_PROXY": WORKSPACE_PROXY_URL,
+        "http_proxy": WORKSPACE_PROXY_URL,
+        "https_proxy": WORKSPACE_PROXY_URL,
+        "NO_PROXY": WORKSPACE_NO_PROXY,
+        "no_proxy": WORKSPACE_NO_PROXY,
+    }
+    return [client.V1EnvVar(name=name, value=value) for name, value in values.items()]
 
 
 def get_optional_args(name: str) -> Optional[list[str]]:
@@ -248,6 +284,9 @@ def validate_runtime_configuration():
             "GENERATOR_SA_NAMESPACE": os.getenv("GENERATOR_SA_NAMESPACE", ""),
             "WATCHER_NAMESPACE": os.getenv("WATCHER_NAMESPACE", ""),
             "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
+            "WORKSPACE_PROXY_URL": WORKSPACE_PROXY_URL,
+            "WORKSPACE_PROXY_NAMESPACE": WORKSPACE_PROXY_NAMESPACE,
+            "WORKSPACE_PROXY_POD_LABEL": WORKSPACE_PROXY_POD_LABEL,
         }
         missing = [name for name, value in required.items() if not str(value).strip()]
         if missing:
@@ -256,6 +295,15 @@ def validate_runtime_configuration():
         get_code_server_image(True)
         build_code_server_args(False)
         build_code_server_args(True)
+    if CONTROLLER_MODE in {"bootstrap", "all"}:
+        required = {
+            "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
+            "EXTERNAL_SECRET_STORE_NAME": EXTERNAL_SECRET_STORE_NAME,
+        }
+        missing = [name for name, value in required.items() if not str(value).strip()]
+        if missing:
+            raise RuntimeError(f"Bootstrap 필수 환경값이 누락되었습니다: {', '.join(missing)}")
+        get_image_pull_secret_remote_names()
 
 
 @app.on_event("startup")
@@ -524,7 +572,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
         client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
         client.V1EnvVar(name="AUTH", value="none"),
         client.V1EnvVar(name="DISPLAY", value=":1")  # VNC Display 설정
-    ] + get_code_server_extra_env(use_vnc)
+    ] + get_code_server_extra_env(use_vnc) + get_workspace_proxy_env()
 
     deployment = client.V1Deployment(
         api_version="apps/v1",
@@ -744,24 +792,98 @@ def ensure_watcher_hook_config(core_v1_api, namespace: str):
     )
 
 
-def ensure_image_pull_secrets(core_v1_api, namespace: str):
-    """Verify secrets injected by External Secrets/bootstrap; never copy secret material."""
+def ensure_external_image_pull_secrets(custom_objects_api, namespace: str):
+    """Create ExternalSecret declarations without reading registry credentials."""
+    targets = get_image_pull_secret_names()
+    remotes = get_image_pull_secret_remote_names()
+    for target_name, remote_name in zip(targets, remotes):
+        external_secret_name = f"{target_name}-sync"
+        body = {
+            "apiVersion": "external-secrets.io/v1beta1",
+            "kind": "ExternalSecret",
+            "metadata": {
+                "name": external_secret_name,
+                "namespace": namespace,
+                "labels": {"app.kubernetes.io/managed-by": "jcode-generator"},
+            },
+            "spec": {
+                "refreshInterval": EXTERNAL_SECRET_REFRESH_INTERVAL,
+                "secretStoreRef": {
+                    "name": EXTERNAL_SECRET_STORE_NAME,
+                    "kind": EXTERNAL_SECRET_STORE_KIND,
+                },
+                "target": {
+                    "name": target_name,
+                    "creationPolicy": "Owner",
+                    "template": {"type": "kubernetes.io/dockerconfigjson"},
+                },
+                "dataFrom": [{"extract": {"key": remote_name}}],
+            },
+        }
+        try:
+            custom_objects_api.get_namespaced_custom_object(
+                group="external-secrets.io",
+                version="v1beta1",
+                namespace=namespace,
+                plural="externalsecrets",
+                name=external_secret_name,
+            )
+            custom_objects_api.patch_namespaced_custom_object(
+                group="external-secrets.io",
+                version="v1beta1",
+                namespace=namespace,
+                plural="externalsecrets",
+                name=external_secret_name,
+                body=body,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            custom_objects_api.create_namespaced_custom_object(
+                group="external-secrets.io",
+                version="v1beta1",
+                namespace=namespace,
+                plural="externalsecrets",
+                body=body,
+            )
+        logger.info("ExternalSecret '%s' 적용 완료: '%s'.", external_secret_name, namespace)
+
+
+def wait_for_external_image_pull_secrets(custom_objects_api, namespace: str):
+    """Wait for ExternalSecret readiness without reading registry credentials."""
     secret_names = get_image_pull_secret_names()
     if not secret_names:
         raise RuntimeError("IMAGE_PULL_SECRET_NAMES는 최소 1개 이상 설정해야 합니다.")
-    for secret_name in secret_names:
-        try:
-            core_v1_api.read_namespaced_secret(name=secret_name, namespace=namespace)
-            logger.info(f"ImagePullSecret '{secret_name}' 존재 확인: '{namespace}'.")
-        except ApiException as e:
-            if e.status == 404:
-                raise RuntimeError(
-                    f"ImagePullSecret '{secret_name}'가 Namespace '{namespace}'에 없습니다. "
-                    "External Secrets 또는 별도 secret sync를 먼저 완료하세요."
+    deadline = time.monotonic() + IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS
+    pending = {f"{name}-sync" for name in secret_names}
+    while pending:
+        for external_secret_name in list(pending):
+            try:
+                external_secret = custom_objects_api.get_namespaced_custom_object(
+                    group="external-secrets.io",
+                    version="v1beta1",
+                    namespace=namespace,
+                    plural="externalsecrets",
+                    name=external_secret_name,
                 )
-            raise
+                conditions = external_secret.get("status", {}).get("conditions", [])
+                if any(
+                    item.get("type") == "Ready" and str(item.get("status")).lower() == "true"
+                    for item in conditions
+                ):
+                    pending.remove(external_secret_name)
+                    logger.info("ExternalSecret '%s' 준비 완료: '%s'.", external_secret_name, namespace)
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+        if pending and time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"ExternalSecret 동기화 시간 초과: Namespace '{namespace}', resources={sorted(pending)}"
+            )
+        if pending:
+            time.sleep(1)
 
-def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, namespace: str, course_id: int, use_vnc: bool = False):
+def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, custom_objects_api, namespace: str, course_id: int, use_vnc: bool = False):
     """jcode-init.sh와 동일한 7개 리소스를 생성하여 NS를 초기화합니다."""
 
     # 1. Namespace
@@ -779,6 +901,8 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
             logger.info(f"Namespace '{namespace}'가 이미 존재합니다.")
         else:
             raise
+
+    ensure_external_image_pull_secrets(custom_objects_api, namespace)
 
     # 2. ServiceAccount
     sa_body = client.V1ServiceAccount(
@@ -823,11 +947,6 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
                 api_groups=[""],
                 resources=["configmaps"],
                 verbs=["create", "get", "list", "watch", "update", "patch"]
-            ),
-            client.V1PolicyRule(
-                api_groups=[""],
-                resources=["secrets"],
-                verbs=["get"]
             ),
         ]
     )
@@ -991,6 +1110,19 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
                     ],
                     ports=[client.V1NetworkPolicyPort(port=3000, protocol="TCP")],
                 ),
+                client.V1NetworkPolicyEgressRule(
+                    to=[
+                        client.V1NetworkPolicyPeer(
+                            namespace_selector=client.V1LabelSelector(
+                                match_labels={"kubernetes.io/metadata.name": WORKSPACE_PROXY_NAMESPACE}
+                            ),
+                            pod_selector=client.V1LabelSelector(
+                                match_labels={"app": WORKSPACE_PROXY_POD_LABEL}
+                            ),
+                        )
+                    ],
+                    ports=[client.V1NetworkPolicyPort(port=WORKSPACE_PROXY_PORT, protocol="TCP")],
+                ),
             ],
             policy_types=["Egress"],
         ),
@@ -1012,8 +1144,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
         else:
             raise
 
-    # Image pull secret material is injected by an external secret sync. The
-    # Workspace Controller verifies it immediately before creating a Pod.
+    wait_for_external_image_pull_secrets(custom_objects_api, namespace)
 
 
 def delete_all_resources_in_namespace(core_v1_api, apps_v1_api, namespace: str):
@@ -1060,6 +1191,7 @@ async def create_namespace_api(
     apps_v1_api = client.AppsV1Api()
     rbac_v1_api = client.RbacAuthorizationV1Api()
     networking_v1_api = client.NetworkingV1Api()
+    custom_objects_api = client.CustomObjectsApi()
 
     try:
         init_namespace(
@@ -1067,6 +1199,7 @@ async def create_namespace_api(
             apps_v1_api,
             rbac_v1_api,
             networking_v1_api,
+            custom_objects_api,
             request.namespace,
             request.course_id,
             request.use_vnc,
@@ -1150,7 +1283,6 @@ async def deploy_resources(
     try:
         verify_course_namespace(core_v1_api, request.namespace, request.course_id)
         ensure_code_server_config(core_v1_api, request.namespace)
-        ensure_image_pull_secrets(core_v1_api, request.namespace)
         if request.use_vnc:
             ensure_watcher_hook_config(core_v1_api, request.namespace)
     except Exception as e:
