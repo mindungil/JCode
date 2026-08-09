@@ -84,3 +84,48 @@ def test_ensure_image_pull_secrets_skips_when_not_configured(generator, monkeypa
             raise AssertionError("secret API should not be called")
 
     generator.ensure_image_pull_secrets(CoreV1(), "jcode-course-1")
+
+
+def test_watcher_hook_config_is_created_and_contains_dynamic_assignment_lookup(generator):
+    class CoreV1:
+        def __init__(self):
+            self.created = None
+
+        def read_namespaced_config_map(self, name, namespace):
+            raise generator.ApiException(status=404)
+
+        def create_namespaced_config_map(self, namespace, body):
+            self.created = body
+
+    core_v1 = CoreV1()
+    generator.ensure_watcher_hook_config(core_v1, "jcode-course-1")
+
+    assert core_v1.created.metadata.name == "watcher-hook-config"
+    hook = core_v1.created.data["99-watcher-hook.py"]
+    assert "relative_to(WORKSPACE_ROOT)" in hook
+    assert "post_with_retry" in hook
+
+
+def test_managed_config_map_is_replaced_with_resource_version(generator):
+    class CoreV1:
+        def __init__(self):
+            self.replaced = None
+
+        def read_namespaced_config_map(self, name, namespace):
+            return generator.client.V1ConfigMap(
+                metadata=generator.client.V1ObjectMeta(
+                    name=name,
+                    namespace=namespace,
+                    resource_version="17",
+                ),
+                data={"old": "value"},
+            )
+
+        def replace_namespaced_config_map(self, name, namespace, body):
+            self.replaced = body
+
+    core_v1 = CoreV1()
+    generator.ensure_code_server_config(core_v1, "jcode-course-1")
+
+    assert core_v1.replaced.metadata.resource_version == "17"
+    assert "config.yaml" in core_v1.replaced.data

@@ -43,7 +43,7 @@ rules:
   verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["configmaps"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["create", "get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["create", "get", "list", "watch"]

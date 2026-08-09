@@ -5,6 +5,7 @@ import stat
 import time
 import logging
 import requests
+from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Form, File, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -77,6 +78,7 @@ class DeleteRequest(BaseModel):
 
 class NamespaceRequest(BaseModel):
     namespace: str
+    use_vnc: bool = False
 
 class ProvisionRequest(BaseModel):
     namespace: str
@@ -461,6 +463,8 @@ def delete_deployment(apps_v1_api, namespace: str, deployment_name: str) -> str:
         logger.info(f"Deployment '{deployment_name}' 삭제 완료")
         return f"Deployment '{deployment_name}' 삭제 완료"
     except ApiException as e:
+        if e.status == 404:
+            return f"Deployment '{deployment_name}'는 이미 삭제되었습니다."
         logger.exception("Deployment 삭제 중 오류:")
         raise Exception(f"Deployment 삭제 중 오류: {str(e)}")
 
@@ -475,6 +479,8 @@ def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
         logger.info(f"Service '{service_name}' 삭제 완료")
         return f"Service '{service_name}' 삭제 완료"
     except ApiException as e:
+        if e.status == 404:
+            return f"Service '{service_name}'는 이미 삭제되었습니다."
         logger.exception("Service 삭제 중 오류:")
         raise Exception(f"Service 삭제 중 오류: {str(e)}")
     
@@ -494,6 +500,46 @@ GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-generator")
 GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
 NS_ROLE_LABEL = os.getenv("NS_ROLE_LABEL", "jcode")
 WATCHER_NAMESPACE = os.getenv("WATCHER_NAMESPACE", "watcher")
+CONFIG_VERSION = os.getenv("JCODE_CONFIG_VERSION", "2026-08-09")
+
+
+def upsert_config_map(core_v1_api, namespace: str, name: str, data: dict[str, str]):
+    metadata = client.V1ObjectMeta(
+        name=name,
+        namespace=namespace,
+        labels={"app.kubernetes.io/managed-by": "jcode-generator"},
+        annotations={"jcode/config-version": CONFIG_VERSION},
+    )
+    body = client.V1ConfigMap(metadata=metadata, data=data)
+    try:
+        existing = core_v1_api.read_namespaced_config_map(name=name, namespace=namespace)
+        body.metadata.resource_version = existing.metadata.resource_version
+        core_v1_api.replace_namespaced_config_map(name=name, namespace=namespace, body=body)
+        logger.info(f"ConfigMap '{name}' 갱신 완료")
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        core_v1_api.create_namespaced_config_map(namespace=namespace, body=body)
+        logger.info(f"ConfigMap '{name}' 생성 완료")
+
+
+def ensure_code_server_config(core_v1_api, namespace: str):
+    upsert_config_map(
+        core_v1_api,
+        namespace,
+        "code-server-config",
+        {"config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n"},
+    )
+
+
+def ensure_watcher_hook_config(core_v1_api, namespace: str):
+    hook_path = Path(os.getenv("WATCHER_HOOK_PATH", Path(__file__).with_name("watcher_hook.py")))
+    upsert_config_map(
+        core_v1_api,
+        namespace,
+        "watcher-hook-config",
+        {"99-watcher-hook.py": hook_path.read_text(encoding="utf-8")},
+    )
 
 
 def ensure_image_pull_secrets(core_v1_api, namespace: str):
@@ -536,7 +582,7 @@ def ensure_image_pull_secrets(core_v1_api, namespace: str):
             else:
                 raise
 
-def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, namespace: str):
+def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, namespace: str, use_vnc: bool = False):
     """jcode-init.sh와 동일한 7개 리소스를 생성하여 NS를 초기화합니다."""
 
     # 1. Namespace
@@ -591,7 +637,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
             client.V1PolicyRule(
                 api_groups=[""],
                 resources=["configmaps"],
-                verbs=["get", "list", "watch"]
+                verbs=["create", "get", "list", "watch", "update", "patch"]
             ),
             client.V1PolicyRule(
                 api_groups=[""],
@@ -605,7 +651,12 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
         logger.info(f"Role 'deployment-manager' 생성 완료")
     except ApiException as e:
         if e.status == 409:
-            logger.info(f"Role 'deployment-manager'가 이미 존재합니다.")
+            rbac_v1_api.patch_namespaced_role(
+                name="deployment-manager",
+                namespace=namespace,
+                body=role_body,
+            )
+            logger.info(f"Role 'deployment-manager' 갱신 완료")
         else:
             raise
 
@@ -638,23 +689,9 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, nam
             raise
 
     # 5. ConfigMap (code-server-config)
-    cm_body = client.V1ConfigMap(
-        metadata=client.V1ObjectMeta(
-            name="code-server-config",
-            namespace=namespace
-        ),
-        data={
-            "config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n"
-        }
-    )
-    try:
-        core_v1_api.create_namespaced_config_map(namespace=namespace, body=cm_body)
-        logger.info(f"ConfigMap 'code-server-config' 생성 완료")
-    except ApiException as e:
-        if e.status == 409:
-            logger.info(f"ConfigMap 'code-server-config'가 이미 존재합니다.")
-        else:
-            raise
+    ensure_code_server_config(core_v1_api, namespace)
+    if use_vnc:
+        ensure_watcher_hook_config(core_v1_api, namespace)
 
     # 6. LimitRange
     lr_body = client.V1LimitRange(
@@ -776,7 +813,14 @@ async def create_namespace_api(request: NamespaceRequest, token_payload: dict = 
     networking_v1_api = client.NetworkingV1Api()
 
     try:
-        init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, request.namespace)
+        init_namespace(
+            core_v1_api,
+            apps_v1_api,
+            rbac_v1_api,
+            networking_v1_api,
+            request.namespace,
+            request.use_vnc,
+        )
         return {"msg": f"Namespace '{request.namespace}' 초기화 완료"}
     except Exception as e:
         logger.exception("네임스페이스 초기화 중 오류:")
@@ -792,8 +836,10 @@ async def delete_namespace_api(ns: str, token_payload: dict = Depends(verify_tok
 
     try:
         core_v1_api.read_namespace(name=ns)
-    except ApiException:
-        raise HTTPException(status_code=404, detail=f"Namespace '{ns}'가 존재하지 않습니다.")
+    except ApiException as e:
+        if e.status == 404:
+            return {"msg": f"Namespace '{ns}'는 이미 삭제되었습니다."}
+        raise
 
     try:
         core_v1_api.delete_namespace(name=ns)
@@ -814,8 +860,10 @@ async def delete_namespace_resources_api(ns: str, token_payload: dict = Depends(
 
     try:
         core_v1_api.read_namespace(name=ns)
-    except ApiException:
-        raise HTTPException(status_code=404, detail=f"Namespace '{ns}'가 존재하지 않습니다.")
+    except ApiException as e:
+        if e.status == 404:
+            return {"msg": f"Namespace '{ns}'의 리소스는 이미 없습니다."}
+        raise
 
     try:
         delete_all_resources_in_namespace(core_v1_api, apps_v1_api, ns)
@@ -832,18 +880,21 @@ async def deploy_resources(request: DeployRequest, token_payload: dict = Depends
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
-    # 네임스페이스 존재 여부 확인 — 없으면 자동 생성
+    # 신규·기존 Namespace 모두 관리 리소스와 ConfigMap을 idempotent하게 동기화한다.
     try:
-        core_v1_api.read_namespace(name=request.namespace)
-    except ApiException:
-        logger.info(f"Namespace '{request.namespace}'가 없습니다. 자동 생성합니다.")
-        try:
-            rbac_v1_api = client.RbacAuthorizationV1Api()
-            networking_v1_api = client.NetworkingV1Api()
-            init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, request.namespace)
-        except Exception as e:
-            logger.exception("네임스페이스 자동 생성 실패:")
-            raise HTTPException(status_code=500, detail=f"Namespace 자동 생성 실패: {str(e)}")
+        rbac_v1_api = client.RbacAuthorizationV1Api()
+        networking_v1_api = client.NetworkingV1Api()
+        init_namespace(
+            core_v1_api,
+            apps_v1_api,
+            rbac_v1_api,
+            networking_v1_api,
+            request.namespace,
+            request.use_vnc,
+        )
+    except Exception as e:
+        logger.exception("네임스페이스 초기화·동기화 실패:")
+        raise HTTPException(status_code=500, detail=f"Namespace 초기화 실패: {str(e)}")
 
     try:
         deployment_msg = create_deployment(
@@ -886,11 +937,9 @@ async def delete_resources(request: DeleteRequest, token_payload: dict = Depends
     try:
         core_v1_api.read_namespace(name=request.namespace)
     except ApiException as e:
-        logger.exception("네임스페이스 조회 오류:")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Namespace '{request.namespace}'가 존재하지 않습니다. 관리자에게 문의하세요."
-        )
+        if e.status == 404:
+            return {"msg": f"Namespace '{request.namespace}'와 JCode 리소스는 이미 없습니다."}
+        raise
 
     try:
         # 삭제 시에는 file_path, app_label 등은 사용하지 않고 이름만 사용
