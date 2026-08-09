@@ -5,9 +5,7 @@ FROM ${JCODE_CODE_SERVER_BASE} AS builder
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 미러 서버 변경 (한국 미러: ftp.kr.debian.org)
-RUN sed -i 's|http://deb.debian.org/debian|http://ftp.kr.debian.org/debian|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://deb.debian.org/debian-security|http://ftp.kr.debian.org/debian-security|g' /etc/apt/sources.list.d/debian.sources
+# 기본 Debian mirror를 사용한다.
 
 # 필수 패키지 설치 (최종 스테이지에서는 runit 대신 supervisord를 사용할 예정)
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -59,9 +57,7 @@ LABEL org.opencontainers.image.source="https://github.com/coder/code-server"
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 미러 서버 변경 (한국 미러: ftp.kr.debian.org)
-RUN sed -i 's|http://deb.debian.org/debian|http://ftp.kr.debian.org/debian|g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i 's|http://deb.debian.org/debian-security|http://ftp.kr.debian.org/debian-security|g' /etc/apt/sources.list.d/debian.sources
+# 기본 Debian mirror를 사용한다.
 
 # 최종 이미지에서는 빌더에서 설정한 내용만 복사 (필요한 런타임 설정 파일)
 COPY --from=builder /runtime/ /runtime/
@@ -83,7 +79,17 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     build-essential \
     libc6-dev \
     supervisor \
-    netcat-openbsd && \
+    netcat-openbsd \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
+    libxcb-xinerama0 \
+    libxcb-xkb1 \
+    libxkbcommon-x11-0 \
+    libxkbcommon0 \
+    fonts-nanum && \
     rm -rf /var/lib/apt/lists/*
 
 # coder 유저의 pip 설정 추가 (break-system-packages)
@@ -115,8 +121,8 @@ RUN cp -r /runtime/.vnc /home/coder/ && \
     chown -R 1000:1000 /home/coder && \
     chown -R 1000:1000 /home/coder/.ipython/profile_default/startup
 
-# supervisord.conf 복사 (Docker build 컨텍스트 내 supervisor 디렉토리에 위치)
-COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+# 환경별 비밀값이 없는 재현 가능한 기본 supervisor 설정
+COPY supervisor/supervisord.default.conf /etc/supervisor/supervisord.conf
 
 # UX guard only. The actual boundary is the Pod security context and NFS mount.
 COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
