@@ -1,0 +1,32 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+jobs:
+  generator:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: generator/requirements.txt
+      - run: python -m pip install -r generator/requirements.txt pytest
+      - run: python -m pytest -q generator/tests
+      - name: Validate manifests and shell
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          for path in Path("generator/k8s").glob("*.yaml"):
+              list(yaml.safe_load_all(path.read_text()))
+          PY
+          bash -n generator/k8s/jcode-init.sh
+

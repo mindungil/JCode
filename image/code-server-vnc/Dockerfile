@@ -1,5 +1,6 @@
 # === Builder Stage ===
-FROM codercom/code-server:4.98.0 AS builder
+ARG JCODE_CODE_SERVER_BASE
+FROM ${JCODE_CODE_SERVER_BASE} AS builder
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
@@ -23,13 +24,11 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 RUN echo "exec openbox-session" > ~/.xsession && \
     echo "exec openbox-session" > ~/.xinitrc
 
-# VNC 암호 설정 (비밀번호 "password"로 설정)
-RUN mkdir -p /root/.vnc && \
-    echo "password" | vncpasswd -f > /root/.vnc/passwd && \
-    chmod 600 /root/.vnc/passwd
+# VNC는 ClusterIP + Router 인증 뒤에서만 제공하며 이미지에 공용 비밀번호를 넣지 않는다.
+RUN mkdir -p /root/.vnc
 
 # VNC 서버 실행 테스트 (화면 :1) - 설정 확인용으로 실행 후 종료
-RUN vncserver :1 -geometry 1280x800 -depth 24 -passwd /root/.vnc/passwd && \
+RUN vncserver :1 -geometry 1280x800 -depth 24 -SecurityTypes None && \
     vncserver -kill :1
 
 # VNC 세션에 openbox 실행 (VNC 접속 시 최소한의 창 관리자만 실행)
@@ -49,7 +48,7 @@ RUN mkdir -p /runtime && \
 # supervisord.conf는 나중에 Final Stage에서 복사할 예정이므로 빌더 스테이지에선 생성하지 않아도 됩니다.
 
 # === Final Stage ===
-FROM codercom/code-server:4.98.0
+FROM ${JCODE_CODE_SERVER_BASE}
 
 LABEL org.opencontainers.image.title="code-server-vnc"
 LABEL org.opencontainers.image.description="VS Code(code-server) + VNC/novnc 환경 이미지"
@@ -118,6 +117,10 @@ RUN cp -r /runtime/.vnc /home/coder/ && \
 
 # supervisord.conf 복사 (Docker build 컨텍스트 내 supervisor 디렉토리에 위치)
 COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+
+# UX guard only. The actual boundary is the Pod security context and NFS mount.
+COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
+RUN chmod 644 /etc/profile.d/restricted-shell.sh
 
 # 포트 개방 (code-server:8080, VNC:5900~5910, websockify(noVNC):6080~6100)
 EXPOSE 8080 5900-5910 6080-6100

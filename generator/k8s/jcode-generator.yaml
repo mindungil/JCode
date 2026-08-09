@@ -1,3 +1,10 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jcode-workspace
+  namespace: watcher
+automountServiceAccountToken: true
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,10 +21,11 @@ spec:
       labels:
         app: jcode-generator
     spec:
-      serviceAccountName: jcode-generator  # 설정된 네임스페이스에 배포 권한을 가지는 서비스어카운트 (jcode-init)
+      serviceAccountName: jcode-workspace
       containers:
       - name: jcode-generator
         image: jcode-generator:test
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 5000
         envFrom:
@@ -25,6 +33,21 @@ spec:
             name: jcode-generator-configmap
         - secretRef:
             name: jcode-generator-secret
+        env:
+        - name: CONTROLLER_MODE
+          value: "workspace"
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 5000
+          initialDelaySeconds: 15
+          periodSeconds: 20
         resources:
           requests:
             cpu: 200m
@@ -47,6 +70,25 @@ spec:
   - name: generator
     port: 5000
     targetPort: 5000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jcode-workspace-backend-only
+  namespace: watcher
+spec:
+  podSelector:
+    matchLabels:
+      app: jcode-generator
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: jcode-backend
+    ports:
+    - protocol: TCP
+      port: 5000
+  policyTypes: ["Ingress"]
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor

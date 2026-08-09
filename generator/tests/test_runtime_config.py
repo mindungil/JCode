@@ -10,8 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @pytest.fixture()
 def generator(monkeypatch):
-    monkeypatch.setenv("SECRET_KEY", "test-secret")
-    monkeypatch.setenv("ALGORITHM", "HS256")
+    monkeypatch.setenv("GENERATOR_SERVICE_SECRET", "0123456789abcdef0123456789abcdef")
+    monkeypatch.setenv("CONTROLLER_MODE", "all")
+    monkeypatch.setenv("WORKSPACE_ROOT", "/home/coder/project")
     monkeypatch.setattr(config, "load_incluster_config", lambda: None)
     module = importlib.import_module("main")
     return importlib.reload(module)
@@ -36,43 +37,37 @@ def test_code_server_args_are_shell_split(generator, monkeypatch):
         "--app-name",
         "JCode IDE",
         "/home/coder/project",
+        "--auth",
+        "none",
+        "--restrict-workspace-root",
+        "/home/coder/project",
     ]
 
 
-def test_ensure_image_pull_secrets_copies_configured_secret(generator, monkeypatch):
+def test_workspace_root_rejects_prefix_collision(generator, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_ROOT", "/home/coder/project-escape")
+
+    with pytest.raises(RuntimeError):
+        generator.get_workspace_root()
+
+
+def test_ensure_image_pull_secrets_requires_preprovisioned_secret(generator, monkeypatch):
     monkeypatch.setenv("IMAGE_PULL_SECRET_NAMES", "harbor-jcode-pull")
     monkeypatch.setenv("IMAGE_PULL_SECRET_SOURCE_NAMESPACE", "watcher")
 
     class CoreV1:
-        def __init__(self):
-            self.created = []
-
         def read_namespaced_secret(self, name, namespace):
-            if namespace == "jcode-course-1":
-                raise generator.ApiException(status=404)
             return generator.client.V1Secret(
                 metadata=generator.client.V1ObjectMeta(name=name),
                 data={".dockerconfigjson": "encoded"},
                 type="kubernetes.io/dockerconfigjson",
             )
 
-        def create_namespaced_secret(self, namespace, body):
-            self.created.append((namespace, body.metadata.name, body.data, body.type))
-
     core_v1 = CoreV1()
     generator.ensure_image_pull_secrets(core_v1, "jcode-course-1")
 
-    assert core_v1.created == [
-        (
-            "jcode-course-1",
-            "harbor-jcode-pull",
-            {".dockerconfigjson": "encoded"},
-            "kubernetes.io/dockerconfigjson",
-        )
-    ]
 
-
-def test_ensure_image_pull_secrets_skips_when_not_configured(generator, monkeypatch):
+def test_ensure_image_pull_secrets_fails_when_not_configured(generator, monkeypatch):
     monkeypatch.delenv("IMAGE_PULL_SECRET_NAMES", raising=False)
     monkeypatch.delenv("IMAGE_PULL_SECRET_NAME", raising=False)
 
@@ -83,7 +78,8 @@ def test_ensure_image_pull_secrets_skips_when_not_configured(generator, monkeypa
         def create_namespaced_secret(self, namespace, body):
             raise AssertionError("secret API should not be called")
 
-    generator.ensure_image_pull_secrets(CoreV1(), "jcode-course-1")
+    with pytest.raises(RuntimeError):
+        generator.ensure_image_pull_secrets(CoreV1(), "jcode-course-1")
 
 
 def test_watcher_hook_config_is_created_and_contains_dynamic_assignment_lookup(generator):

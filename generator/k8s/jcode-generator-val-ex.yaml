@@ -9,15 +9,17 @@ data:
   NFS_PATH: "/yourPath"
   SNAPSHOT_NFS_SERVER: "your.nfs.snapshot.server.address"
   SNAPSHOT_NFS_PATH: "/yourSnapshotPath"
-  SERVICE_ACCOUNT: "deployment-controller"
-  CODE_SERVER_IMAGE: "code-server:test"
-  CODE_SERVER_VNC_IMAGE: "code-server-vnc:test"
+  SERVICE_ACCOUNT: "jcode-workload"
+  CODE_SERVER_IMAGE: "harbor.example.com/jcode/code-server:0123456789abcdef"
+  CODE_SERVER_VNC_IMAGE: "harbor.example.com/jcode/code-server-vnc:0123456789abcdef"
   IMAGE_PULL_POLICY: "IfNotPresent"
-  IMAGE_PULL_SECRET_NAMES: ""
-  IMAGE_PULL_SECRET_SOURCE_NAMESPACE: "watcher"
-  CODE_SERVER_ARGS: ""
-  CODE_SERVER_VNC_ARGS: ""
-  WORKSPACE_ROOT: ""
+  IMAGE_PULL_SECRET_NAMES: "harbor-jcode-pull"
+  CODE_SERVER_ARGS: "--restrict-workspace-root /home/coder/project /home/coder/project"
+  CODE_SERVER_VNC_ARGS: "--restrict-workspace-root /home/coder/project /home/coder/project"
+  WORKSPACE_ROOT: "/home/coder/project"
+  GENERATOR_SA_NAME: "jcode-workspace"
+  GENERATOR_SA_NAMESPACE: "watcher"
+  WATCHER_NAMESPACE: "watcher"
   STARTER_ZIP_MAX_BYTES: "52428800"
   STARTER_ZIP_MAX_UNCOMPRESSED_BYTES: "209715200"
   STARTER_ZIP_MAX_FILES: "1000"
@@ -29,4 +31,4 @@ metadata:
   namespace: watcher
 type: Opaque
 data:
-  SECRET_KEY: "WU9VUl9TRUNSRVRfS0VZX0JBU0U2NA==" # ("YOUR_SECRET_KEY_BASE64")
+  GENERATOR_SERVICE_SECRET: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" # 32-byte example; replace through Secret manager
