@@ -1,7 +1,7 @@
 #!/bin/bash
 # JCode Restricted Shell
 # 학생이 워크스페이스 루트 상위로 이동하는 것을 제한합니다.
-# WORKSPACE_ROOT 환경변수가 설정된 경우에��� 제한이 적용됩니다.
+# WORKSPACE_ROOT 환경변수가 설정된 경우에만 제한이 적용됩니다.
 
 # cd 명령어 오버라이드
 cd() {

@@ -486,9 +486,9 @@ PROTECTED_NAMESPACES = {"default", "kube-system", "kube-public", "kube-node-leas
 def validate_namespace(ns: str):
     """jcode-{code}-{clss} 패턴만 허용하고, 시스템 NS 조작을 차단합니다."""
     if ns in PROTECTED_NAMESPACES:
-        raise HTTPException(status_code=403, detail=f"시스템 네임스페이스 '{ns}'�� 조작할 수 없습니다.")
+        raise HTTPException(status_code=403, detail=f"시스템 네임스페이스 '{ns}'는 조작할 수 없습니다.")
     if not ALLOWED_NS_PATTERN.match(ns):
-        raise HTTPException(status_code=400, detail=f"네임스��이스 이름이 허용된 패턴(jcode-{{code}}-{{clss}})과 일���하지 않습니다: '{ns}'")
+        raise HTTPException(status_code=400, detail=f"네임스페이스 이름이 허용된 패턴(jcode-{{code}}-{{clss}})과 일치하지 않습니다: '{ns}'")
 
 GENERATOR_SA_NAME = os.getenv("GENERATOR_SA_NAME", "jcode-generator")
 GENERATOR_SA_NAMESPACE = os.getenv("GENERATOR_SA_NAMESPACE", "watcher")
