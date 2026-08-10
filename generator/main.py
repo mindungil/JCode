@@ -202,17 +202,27 @@ def get_code_server_extra_env(use_vnc: bool) -> list[client.V1EnvVar]:
     return env
 
 
-def get_code_server_image(use_vnc: bool) -> str:
-    name = "CODE_SERVER_VNC_IMAGE" if use_vnc else "CODE_SERVER_IMAGE"
+def get_immutable_harbor_image(name: str) -> str:
     image = os.getenv(name, "").strip()
     if not image:
-        raise RuntimeError(f"{name}를 커스텀 JCode CodeServer 이미지로 설정해야 합니다.")
+        raise RuntimeError(f"{name}를 Harbor 이미지로 설정해야 합니다.")
+    if not image.startswith("harbor.jbnu.ac.kr/"):
+        raise RuntimeError(f"{name}는 harbor.jbnu.ac.kr 이미지여야 합니다: {image}")
     mutable_tag = image.endswith((":latest", ":test", ":v2", ":v2-test"))
     digest_pinned = bool(re.search(r"@sha256:[0-9a-f]{64}$", image))
     commit_tagged = bool(re.search(r":[^/@]*[0-9a-f]{7,40}(?:[-._][^/]*)?$", image))
     if mutable_tag or not (digest_pinned or commit_tagged):
         raise RuntimeError(f"{name}는 commit tag 또는 sha256 digest로 고정해야 합니다: {image}")
     return image
+
+
+def get_code_server_image(use_vnc: bool) -> str:
+    name = "CODE_SERVER_VNC_IMAGE" if use_vnc else "CODE_SERVER_IMAGE"
+    return get_immutable_harbor_image(name)
+
+
+def get_workspace_init_image() -> str:
+    return get_immutable_harbor_image("WORKSPACE_INIT_IMAGE")
 
 
 def validate_workspace_dir_name(dir_name: str) -> str:
@@ -311,6 +321,7 @@ def validate_runtime_configuration():
             raise RuntimeError(f"Generator 필수 환경값이 누락되었습니다: {', '.join(missing)}")
         get_code_server_image(False)
         get_code_server_image(True)
+        get_workspace_init_image()
         build_code_server_args(False)
         build_code_server_args(True)
         validate_nfs_mount()
@@ -614,7 +625,8 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                     init_containers=[
                         client.V1Container(
                             name="fix-permissions",
-                            image="busybox",
+                            image=get_workspace_init_image(),
+                            image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
                             command=init_command,
                             volume_mounts=init_volume_mounts    # 동적으로 만든 init_volume_mounts 리스트 적용
                         )
@@ -1263,7 +1275,7 @@ async def delete_namespace_api(
         core_v1_api.read_namespace(name=ns)
     except ApiException as e:
         if e.status == 404:
-            return {"msg": f"Namespace '{ns}'는 이미 삭제되었습니다."}
+            return {"msg": f"Namespace '{ns}'는 이미 삭제되었습니다.", "deleted": True}
         raise
 
     verify_course_namespace(core_v1_api, ns, course_id)

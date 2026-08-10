@@ -30,6 +30,7 @@ jobs:
           PY
           bash -n generator/k8s/jcode-init.sh
           bash -n generator/k8s/bootstrap-prerequisites.sh
+          bash -n generator/k8s/configure-workspace-storage.sh
           bash -n router/k8s/configure-squid.sh
           bash -n deploy/deploy.sh
       - name: Verify Generator workspace mount
@@ -38,3 +39,8 @@ jobs:
           grep -q 'mountPath: /nfs-data' generator/k8s/jcode-generator.yaml
           grep -q 'claimName: jcode-vol-pvc' generator/k8s/jcode-generator.yaml
           if grep -R -q '{{HTTP_PORT}}\|{{ALLOWED_NETWORK_CIDR}}' router/k8s; then exit 1; fi
+          if grep -R -nE '(^|[[:space:]])image:[[:space:]]+([^/[:space:]]+/)?[^[:space:]]+:latest|image="busybox"' generator router; then exit 1; fi
+          grep -q 'WORKSPACE_INIT_IMAGE' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'volumeHandle' generator/k8s/configure-workspace-storage.sh
+          grep -q 'harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' router/k8s/squid-exporter.yaml
+          jq -e 'length == 11' deploy/release-digests.example.json >/dev/null

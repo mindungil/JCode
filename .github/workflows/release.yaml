@@ -1,0 +1,120 @@
+name: Deploy platform release
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options: [dev, production]
+      digests:
+        description: "JSON object containing the eleven verified image digests"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-in-order:
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.target }}
+    steps:
+      - name: Checkout JCode
+        uses: actions/checkout@v4
+      - name: Checkout Watcher deployment
+        uses: actions/checkout@v4
+        with:
+          repository: mindungil/JCode-Watcher
+          ref: develop
+          path: release/watcher
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: harbor.jbnu.ac.kr
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Read release digests
+        env:
+          RELEASE_DIGESTS: ${{ inputs.digests }}
+        run: |
+          for mapping in \
+            "WATCHER_BACKEND_DIGEST:watcher_backend" \
+            "WATCHER_FILEMON_DIGEST:watcher_filemon" \
+            "WATCHER_PROCMON_DIGEST:watcher_procmon" \
+            "GENERATOR_DIGEST:generator" \
+            "ROUTER_DIGEST:router" \
+            "CODE_SERVER_DIGEST:code_server" \
+            "CODE_SERVER_VNC_DIGEST:code_server_vnc" \
+            "WORKSPACE_INIT_DIGEST:workspace_init" \
+            "SQUID_EXPORTER_DIGEST:squid_exporter" \
+            "BACKEND_DIGEST:backend" \
+            "FRONTEND_DIGEST:frontend"; do
+            variable="${mapping%%:*}"
+            key="${mapping#*:}"
+            digest=$(jq -er --arg key "$key" '.[$key]' <<< "$RELEASE_DIGESTS")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            echo "${variable}=${digest}" >> "$GITHUB_ENV"
+          done
+      - name: Verify release artifacts
+        run: |
+          for entry in \
+            "jdevops|watcher-backend|${WATCHER_BACKEND_DIGEST}" \
+            "jdevops|watcher-filemon|${WATCHER_FILEMON_DIGEST}" \
+            "jdevops|watcher-procmon|${WATCHER_PROCMON_DIGEST}" \
+            "jdevops|jcode-generator|${GENERATOR_DIGEST}" \
+            "jdevops|jcode-router|${ROUTER_DIGEST}" \
+            "jdevops|code-server|${CODE_SERVER_DIGEST}" \
+            "jdevops|code-server-vnc|${CODE_SERVER_VNC_DIGEST}" \
+            "jdevops|workspace-init|${WORKSPACE_INIT_DIGEST}" \
+            "jdevops|squid-exporter|${SQUID_EXPORTER_DIGEST}" \
+            "jdevops|jcode-backend|${BACKEND_DIGEST}" \
+            "jsh2256|jcode-front|${FRONTEND_DIGEST}"; do
+            IFS='|' read -r project component digest <<< "$entry"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools inspect "harbor.jbnu.ac.kr/${project}/${component}@${digest}"
+          done
+      - uses: azure/setup-kubectl@v4
+      - uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      - name: Deploy Watcher first
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          cd release/watcher
+          python deploy/set-image-digests.py "$TARGET" \
+            "$WATCHER_BACKEND_DIGEST" \
+            "$WATCHER_FILEMON_DIGEST" \
+            "$WATCHER_PROCMON_DIGEST"
+          deploy/deploy.sh "$TARGET"
+      - name: Deploy Generator and Router second
+        env:
+          JCODE_NAMESPACE: ${{ vars.JCODE_NAMESPACE }}
+        run: deploy/deploy.sh
+      - name: Deploy portal Backend third
+        env:
+          KUBE_NAMESPACE: ${{ vars.BACKEND_NAMESPACE }}
+          KUBE_DEPLOYMENT: ${{ vars.BACKEND_DEPLOYMENT }}
+          KUBE_CONTAINER: ${{ vars.BACKEND_CONTAINER }}
+        run: |
+          : "${KUBE_NAMESPACE:?BACKEND_NAMESPACE environment variable is required}"
+          : "${KUBE_DEPLOYMENT:?BACKEND_DEPLOYMENT environment variable is required}"
+          : "${KUBE_CONTAINER:?BACKEND_CONTAINER environment variable is required}"
+          image="harbor.jbnu.ac.kr/jdevops/jcode-backend@${BACKEND_DIGEST}"
+          kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
+          kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m
+      - name: Deploy Frontend last
+        env:
+          KUBE_NAMESPACE: ${{ vars.FRONTEND_NAMESPACE }}
+          KUBE_DEPLOYMENT: ${{ vars.FRONTEND_DEPLOYMENT }}
+          KUBE_CONTAINER: ${{ vars.FRONTEND_CONTAINER }}
+        run: |
+          : "${KUBE_NAMESPACE:?FRONTEND_NAMESPACE environment variable is required}"
+          : "${KUBE_DEPLOYMENT:?FRONTEND_DEPLOYMENT environment variable is required}"
+          : "${KUBE_CONTAINER:?FRONTEND_CONTAINER environment variable is required}"
+          image="harbor.jbnu.ac.kr/jsh2256/jcode-front@${FRONTEND_DIGEST}"
+          kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
+          kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m

@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import sys
 from datetime import datetime, timedelta, timezone
@@ -112,3 +113,15 @@ def test_namespace_delete_timeout_keeps_operation_pending(generator):
             return object()
 
     assert not generator.wait_for_namespace_deleted(Core(), "jcode-os-1", timeout_seconds=0)
+
+
+def test_missing_namespace_is_confirmed_deleted(generator, monkeypatch):
+    class Core:
+        def read_namespace(self, name):
+            raise generator.ApiException(status=404)
+
+    monkeypatch.setattr(generator.client, "CoreV1Api", Core)
+
+    response = asyncio.run(generator.delete_namespace_api("jcode-os-1", 11, {}))
+
+    assert response["deleted"] is True

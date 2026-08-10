@@ -7,7 +7,7 @@ on:
         description: "Deployment environment"
         required: true
         type: choice
-        options: [dev, production]
+        options: [dev]
       generator_digest:
         description: "Generator digest verified in dev"
         required: true
@@ -22,6 +22,14 @@ on:
         type: string
       code_server_vnc_digest:
         description: "VNC IDE digest verified in dev"
+        required: true
+        type: string
+      workspace_init_digest:
+        description: "Workspace init digest verified in dev"
+        required: true
+        type: string
+      squid_exporter_digest:
+        description: "Squid exporter digest verified in dev"
         required: true
         type: string
 
@@ -46,12 +54,16 @@ jobs:
           ROUTER_DIGEST: ${{ inputs.router_digest }}
           CODE_SERVER_DIGEST: ${{ inputs.code_server_digest }}
           CODE_SERVER_VNC_DIGEST: ${{ inputs.code_server_vnc_digest }}
+          WORKSPACE_INIT_DIGEST: ${{ inputs.workspace_init_digest }}
+          SQUID_EXPORTER_DIGEST: ${{ inputs.squid_exporter_digest }}
         run: |
           for entry in \
             "jcode-generator:${GENERATOR_DIGEST}" \
             "jcode-router:${ROUTER_DIGEST}" \
             "code-server:${CODE_SERVER_DIGEST}" \
-            "code-server-vnc:${CODE_SERVER_VNC_DIGEST}"; do
+            "code-server-vnc:${CODE_SERVER_VNC_DIGEST}" \
+            "workspace-init:${WORKSPACE_INIT_DIGEST}" \
+            "squid-exporter:${SQUID_EXPORTER_DIGEST}"; do
             component="${entry%%:*}"
             digest="${entry#*:}"
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -69,4 +81,6 @@ jobs:
           ROUTER_DIGEST: ${{ inputs.router_digest }}
           CODE_SERVER_DIGEST: ${{ inputs.code_server_digest }}
           CODE_SERVER_VNC_DIGEST: ${{ inputs.code_server_vnc_digest }}
+          WORKSPACE_INIT_DIGEST: ${{ inputs.workspace_init_digest }}
+          SQUID_EXPORTER_DIGEST: ${{ inputs.squid_exporter_digest }}
         run: deploy/deploy.sh
