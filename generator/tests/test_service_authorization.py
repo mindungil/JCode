@@ -90,3 +90,25 @@ def test_namespace_resource_cleanup_does_not_delete_pods_directly(generator):
             raise AssertionError("pods must be garbage-collected through Deployment ownership")
 
     generator.delete_all_resources_in_namespace(Core(), Apps(), "jcode-os-1")
+
+
+def test_namespace_delete_waits_for_not_found(generator, monkeypatch):
+    class Core:
+        calls = 0
+
+        def read_namespace(self, name):
+            self.calls += 1
+            if self.calls == 2:
+                raise generator.ApiException(status=404)
+
+    monkeypatch.setattr(generator.time, "sleep", lambda _: None)
+
+    assert generator.wait_for_namespace_deleted(Core(), "jcode-os-1", timeout_seconds=10)
+
+
+def test_namespace_delete_timeout_keeps_operation_pending(generator):
+    class Core:
+        def read_namespace(self, name):
+            return object()
+
+    assert not generator.wait_for_namespace_deleted(Core(), "jcode-os-1", timeout_seconds=0)

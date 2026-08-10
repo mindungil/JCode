@@ -29,4 +29,12 @@ jobs:
               list(yaml.safe_load_all(path.read_text()))
           PY
           bash -n generator/k8s/jcode-init.sh
-
+          bash -n generator/k8s/bootstrap-prerequisites.sh
+          bash -n router/k8s/configure-squid.sh
+          bash -n deploy/deploy.sh
+      - name: Verify Generator workspace mount
+        run: |
+          grep -q 'name: NFS_MOUNT_PATH' generator/k8s/jcode-generator.yaml
+          grep -q 'mountPath: /nfs-data' generator/k8s/jcode-generator.yaml
+          grep -q 'claimName: jcode-vol-pvc' generator/k8s/jcode-generator.yaml
+          if grep -R -q '{{HTTP_PORT}}\|{{ALLOWED_NETWORK_CIDR}}' router/k8s; then exit 1; fi

@@ -51,6 +51,16 @@ def test_workspace_root_rejects_prefix_collision(generator, monkeypatch):
         generator.get_workspace_root()
 
 
+def test_nfs_mount_requires_workspace_directory(generator, monkeypatch, tmp_path):
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="workspace 경로"):
+        generator.validate_nfs_mount()
+
+    (tmp_path / "workspace").mkdir()
+    generator.validate_nfs_mount()
+
+
 def test_wait_for_external_secret_uses_ready_condition(generator, monkeypatch):
     monkeypatch.setenv("IMAGE_PULL_SECRET_NAMES", "harbor-jcode-pull")
 

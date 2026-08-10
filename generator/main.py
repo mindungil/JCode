@@ -55,6 +55,7 @@ if SERVICE_ALGORITHM != "HS256":
 # NFS 서버 정보: 환경 변수로부터 로드
 NFS_SERVER = os.getenv("NFS_SERVER", "")
 NFS_PATH = os.getenv("NFS_PATH", "")
+NFS_MOUNT_PATH = os.getenv("NFS_MOUNT_PATH", "/nfs-data").strip()
 
 SNAPSHOT_NFS_SERVER = os.getenv("SNAPSHOT_NFS_SERVER", "")
 SNAPSHOT_NFS_PATH = os.getenv("SNAPSHOT_NFS_PATH", "")
@@ -75,6 +76,8 @@ EXTERNAL_SECRET_STORE_NAME = os.getenv("EXTERNAL_SECRET_STORE_NAME", "").strip()
 EXTERNAL_SECRET_STORE_KIND = os.getenv("EXTERNAL_SECRET_STORE_KIND", "ClusterSecretStore").strip()
 EXTERNAL_SECRET_REFRESH_INTERVAL = os.getenv("EXTERNAL_SECRET_REFRESH_INTERVAL", "1h").strip()
 IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS = int(os.getenv("IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS", "60"))
+NAMESPACE_DELETE_TIMEOUT_SECONDS = int(os.getenv("NAMESPACE_DELETE_TIMEOUT_SECONDS", "60"))
+NAMESPACE_DELETE_POLL_SECONDS = float(os.getenv("NAMESPACE_DELETE_POLL_SECONDS", "2"))
 
 # 요청 바디 모델 정의
 class DeployRequest(BaseModel):
@@ -227,6 +230,21 @@ def validate_workspace_dir_name(dir_name: str) -> str:
     return cleaned
 
 
+def get_nfs_workspace_path() -> Path:
+    mount_path = Path(NFS_MOUNT_PATH)
+    if not mount_path.is_absolute():
+        raise RuntimeError("NFS_MOUNT_PATH는 절대 경로여야 합니다.")
+    return mount_path / "workspace"
+
+
+def validate_nfs_mount() -> None:
+    workspace_path = get_nfs_workspace_path()
+    if not workspace_path.is_dir():
+        raise RuntimeError(f"NFS workspace 경로를 찾을 수 없습니다: {workspace_path}")
+    if not os.access(workspace_path, os.R_OK | os.W_OK | os.X_OK):
+        raise RuntimeError(f"NFS workspace 경로에 읽기/쓰기 권한이 없습니다: {workspace_path}")
+
+
 def validate_zip_member(info, target_dir: str):
     raw_name = info.filename
     normalized = os.path.normpath(raw_name)
@@ -295,6 +313,7 @@ def validate_runtime_configuration():
         get_code_server_image(True)
         build_code_server_args(False)
         build_code_server_args(True)
+        validate_nfs_mount()
     if CONTROLLER_MODE in {"bootstrap", "all"}:
         required = {
             "IMAGE_PULL_SECRET_NAMES": os.getenv("IMAGE_PULL_SECRET_NAMES", ""),
@@ -799,7 +818,7 @@ def ensure_external_image_pull_secrets(custom_objects_api, namespace: str):
     for target_name, remote_name in zip(targets, remotes):
         external_secret_name = f"{target_name}-sync"
         body = {
-            "apiVersion": "external-secrets.io/v1beta1",
+            "apiVersion": "external-secrets.io/v1",
             "kind": "ExternalSecret",
             "metadata": {
                 "name": external_secret_name,
@@ -823,14 +842,14 @@ def ensure_external_image_pull_secrets(custom_objects_api, namespace: str):
         try:
             custom_objects_api.get_namespaced_custom_object(
                 group="external-secrets.io",
-                version="v1beta1",
+                version="v1",
                 namespace=namespace,
                 plural="externalsecrets",
                 name=external_secret_name,
             )
             custom_objects_api.patch_namespaced_custom_object(
                 group="external-secrets.io",
-                version="v1beta1",
+                version="v1",
                 namespace=namespace,
                 plural="externalsecrets",
                 name=external_secret_name,
@@ -841,7 +860,7 @@ def ensure_external_image_pull_secrets(custom_objects_api, namespace: str):
                 raise
             custom_objects_api.create_namespaced_custom_object(
                 group="external-secrets.io",
-                version="v1beta1",
+                version="v1",
                 namespace=namespace,
                 plural="externalsecrets",
                 body=body,
@@ -861,7 +880,7 @@ def wait_for_external_image_pull_secrets(custom_objects_api, namespace: str):
             try:
                 external_secret = custom_objects_api.get_namespaced_custom_object(
                     group="external-secrets.io",
-                    version="v1beta1",
+                    version="v1",
                     namespace=namespace,
                     plural="externalsecrets",
                     name=external_secret_name,
@@ -1210,6 +1229,25 @@ async def create_namespace_api(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def wait_for_namespace_deleted(
+    core_v1_api,
+    namespace: str,
+    timeout_seconds: int = NAMESPACE_DELETE_TIMEOUT_SECONDS,
+    poll_seconds: float = NAMESPACE_DELETE_POLL_SECONDS,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            core_v1_api.read_namespace(name=namespace)
+        except ApiException as error:
+            if error.status == 404:
+                return True
+            raise
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_seconds)
+
+
 @app.delete("/api/namespace/{ns}")
 async def delete_namespace_api(
     ns: str,
@@ -1232,8 +1270,16 @@ async def delete_namespace_api(
 
     try:
         core_v1_api.delete_namespace(name=ns)
-        logger.info(f"Namespace '{ns}' 삭제 완료")
-        return {"msg": f"Namespace '{ns}' 삭제 완료"}
+        logger.info("Namespace '%s' 삭제 요청 완료", ns)
+        if not wait_for_namespace_deleted(core_v1_api, ns):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Namespace '{ns}'가 아직 Terminating 상태입니다. 잠시 후 다시 시도해 주세요.",
+            )
+        logger.info("Namespace '%s' 실제 삭제 확인 완료", ns)
+        return {"msg": f"Namespace '{ns}' 삭제 확인 완료", "deleted": True}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("네임스페이스 삭제 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1369,12 +1415,13 @@ async def provision_workspace(
     verify_course_namespace(client.CoreV1Api(), request.namespace, request.course_id)
     dir_name = validate_workspace_dir_name(request.dir_name)
 
-    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
     class_div = request.namespace.replace("jcode-", "", 1)
 
-    base_path = os.path.join(nfs_mount_path, "workspace")
-    if not os.path.isdir(base_path):
-        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+    base_path = str(get_nfs_workspace_path())
+    try:
+        validate_nfs_mount()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
     import glob
     student_dirs = glob.glob(os.path.join(base_path, f"{class_div}-*"))
@@ -1410,12 +1457,12 @@ async def deploy_starter_code(
     import tempfile
     import shutil
 
-    nfs_mount_path = os.getenv("NFS_MOUNT_PATH", "/nfs-data")
     class_div = namespace.replace("jcode-", "", 1)
-    base_path = os.path.join(nfs_mount_path, "workspace")
-
-    if not os.path.isdir(base_path):
-        raise HTTPException(status_code=500, detail=f"NFS workspace 경로를 찾을 수 없습니다: {base_path}")
+    base_path = str(get_nfs_workspace_path())
+    try:
+        validate_nfs_mount()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
     content = await file.read()
     max_zip_bytes = int(os.getenv("STARTER_ZIP_MAX_BYTES", str(50 * 1024 * 1024)))
