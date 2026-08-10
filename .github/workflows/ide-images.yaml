@@ -64,12 +64,14 @@ jobs:
           ide_image="${REGISTRY}/${PROJECT}/code-server:${GITHUB_SHA}"
           vnc_image="${REGISTRY}/${PROJECT}/code-server-vnc:${GITHUB_SHA}"
           docker run --detach --rm --name jcode-ide-smoke \
+            --user 1000:1000 \
             --publish 127.0.0.1:18080:8080 \
             --tmpfs /home/coder/project:uid=1000,gid=1000 \
             "$ide_image" \
             --bind-addr 0.0.0.0:8080 --auth none \
             --restrict-workspace-root /home/coder/project /home/coder/project
           docker run --detach --rm --name jcode-vnc-smoke \
+            --user 1000:1000 \
             --publish 127.0.0.1:18081:8080 \
             --publish 127.0.0.1:16080:6080 \
             --tmpfs /home/coder/project:uid=1000,gid=1000 \
@@ -85,7 +87,16 @@ jobs:
             done
             curl --fail --silent --output /dev/null "http://127.0.0.1:${port}/healthz"
           done
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:16080/vnc.html; then
+              break
+            fi
+            sleep 2
+          done
           curl --fail --silent --output /dev/null http://127.0.0.1:16080/vnc.html
+          docker exec jcode-vnc-smoke nc -z 127.0.0.1 5901
+          test "$(docker inspect --format '{{.State.Running}}' jcode-ide-smoke)" = true
+          test "$(docker inspect --format '{{.State.Running}}' jcode-vnc-smoke)" = true
       - name: Record immutable image digests
         run: |
           echo 'ide=${{ steps.ide.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
