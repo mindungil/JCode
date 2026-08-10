@@ -3,8 +3,18 @@ name: JCode runtime images
 on:
   pull_request:
     branches: [develop]
+    paths:
+      - 'generator/**'
+      - 'router/**'
+      - 'image/workspace-init/**'
+      - 'image/squid-exporter/**'
   push:
     branches: [develop]
+    paths:
+      - 'generator/**'
+      - 'router/**'
+      - 'image/workspace-init/**'
+      - 'image/squid-exporter/**'
 
 permissions:
   contents: read
