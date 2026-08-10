@@ -141,7 +141,7 @@ jobs:
             "jdevops|workspace-init|${WORKSPACE_INIT_DIGEST}" \
             "jdevops|squid-exporter|${SQUID_EXPORTER_DIGEST}" \
             "jdevops|jcode-backend|${BACKEND_DIGEST}" \
-            "jsh2256|jcode-front|${FRONTEND_DIGEST}"; do
+            "jdevops|jcode-front|${FRONTEND_DIGEST}"; do
             IFS='|' read -r project component digest <<< "$entry"
             docker buildx imagetools inspect "harbor.jbnu.ac.kr/${project}/${component}@${digest}"
           done
@@ -185,7 +185,7 @@ jobs:
           : "${KUBE_NAMESPACE:?FRONTEND_NAMESPACE environment variable is required}"
           : "${KUBE_DEPLOYMENT:?FRONTEND_DEPLOYMENT environment variable is required}"
           : "${KUBE_CONTAINER:?FRONTEND_CONTAINER environment variable is required}"
-          image="harbor.jbnu.ac.kr/jsh2256/jcode-front@${FRONTEND_DIGEST}"
+          image="harbor.jbnu.ac.kr/jdevops/jcode-front@${FRONTEND_DIGEST}"
           kubectl set image "deployment/${KUBE_DEPLOYMENT}" "${KUBE_CONTAINER}=${image}" -n "$KUBE_NAMESPACE"
           kubectl rollout status "deployment/${KUBE_DEPLOYMENT}" -n "$KUBE_NAMESPACE" --timeout=5m
       - name: Publish dev release manifest
