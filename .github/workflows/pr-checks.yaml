@@ -43,4 +43,4 @@ jobs:
           grep -q 'WORKSPACE_INIT_IMAGE' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'volumeHandle' generator/k8s/configure-workspace-storage.sh
           grep -q 'harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' router/k8s/squid-exporter.yaml
-          jq -e 'length == 11' deploy/release-digests.example.json >/dev/null
+          jq -e '.schema == 1 and .environment == "dev" and (.digests | length == 11)' deploy/release-manifest.example.json >/dev/null
