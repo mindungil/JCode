@@ -1,0 +1,24 @@
+name: JCode IDE images
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_digest:
+        description: "CodeServer base digest"
+        required: true
+        type: string
+      base_revision:
+        description: "CodeServer base commit SHA"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-develop-build:
+    uses: mindungil/JCode/.github/workflows/ide-images.yaml@develop
+    with:
+      base_digest: ${{ inputs.base_digest }}
+      base_revision: ${{ inputs.base_revision }}
+    secrets: inherit

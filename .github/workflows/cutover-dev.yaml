@@ -1,0 +1,20 @@
+name: Switch dev controllers
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: "Successful dev release run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  run-develop-cutover:
+    uses: mindungil/JCode/.github/workflows/cutover-dev.yaml@develop
+    with:
+      release_run_id: ${{ inputs.release_run_id }}
+    secrets: inherit

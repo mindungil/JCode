@@ -1,0 +1,23 @@
+name: Workflow checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/**]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate workflow files
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/repo" -w /repo rhysd/actionlint:latest \
+            -shellcheck= .github/workflows/*.yaml
+          grep -q 'uses: mindungil/JCode/.github/workflows/release.yaml@develop' .github/workflows/release.yaml
+          grep -q 'uses: mindungil/JCode/.github/workflows/cutover-dev.yaml@develop' .github/workflows/cutover-dev.yaml
+          grep -q 'uses: mindungil/JCode/.github/workflows/ide-images.yaml@develop' .github/workflows/ide-images.yaml
