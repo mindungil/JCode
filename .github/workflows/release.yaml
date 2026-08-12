@@ -1,0 +1,56 @@
+name: Deploy platform release
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options: [dev, production]
+      digests:
+        description: "Dev only: JSON containing the twelve image digests"
+        required: false
+        type: string
+      watcher_ref:
+        description: "Dev only: full Watcher commit SHA"
+        required: false
+        type: string
+      backend_ref:
+        description: "Dev only: full Backend commit SHA"
+        required: false
+        type: string
+      frontend_ref:
+        description: "Dev only: full Frontend commit SHA"
+        required: false
+        type: string
+      code_server_ref:
+        description: "Dev only: full CodeServer commit SHA"
+        required: false
+        type: string
+      cutover_run_id:
+        description: "Production only: successful dev cutover run ID"
+        required: false
+        type: string
+      smoke_course_namespace:
+        description: "Production only: existing course namespace used for lifecycle verification"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  run-develop-release:
+    uses: mindungil/JCode/.github/workflows/release.yaml@develop
+    with:
+      target: ${{ inputs.target }}
+      digests: ${{ inputs.digests }}
+      watcher_ref: ${{ inputs.watcher_ref }}
+      backend_ref: ${{ inputs.backend_ref }}
+      frontend_ref: ${{ inputs.frontend_ref }}
+      code_server_ref: ${{ inputs.code_server_ref }}
+      cutover_run_id: ${{ inputs.cutover_run_id }}
+      smoke_course_namespace: ${{ inputs.smoke_course_namespace }}
+    secrets: inherit
