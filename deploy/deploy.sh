@@ -43,6 +43,7 @@ workspace_init_digest=${WORKSPACE_INIT_DIGEST:?WORKSPACE_INIT_DIGEST is required
 squid_exporter_digest=${SQUID_EXPORTER_DIGEST:?SQUID_EXPORTER_DIGEST is required}
 allowed_network_cidr=${ALLOWED_NETWORK_CIDR:?ALLOWED_NETWORK_CIDR is required}
 workspace_dns_cidrs=${WORKSPACE_DNS_CIDRS:?WORKSPACE_DNS_CIDRS is required}
+workspace_resource_profiles_json=${WORKSPACE_RESOURCE_PROFILES_JSON:?WORKSPACE_RESOURCE_PROFILES_JSON is required}
 
 for digest in "$generator_digest" "$router_digest" "$code_server_digest" "$code_server_vnc_digest" "$workspace_init_digest" "$squid_exporter_digest"; do
   if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -50,8 +51,9 @@ for digest in "$generator_digest" "$router_digest" "$code_server_digest" "$code_
     exit 2
   fi
 done
-python3 - "$allowed_network_cidr" "$workspace_dns_cidrs" <<'PY'
+python3 - "$allowed_network_cidr" "$workspace_dns_cidrs" "$workspace_resource_profiles_json" <<'PY'
 import ipaddress
+import json
 import sys
 
 try:
@@ -69,6 +71,15 @@ for value in dns_cidrs:
         ipaddress.ip_network(value, strict=True)
     except ValueError as error:
         raise SystemExit(f"WORKSPACE_DNS_CIDRS contains an invalid CIDR ({value}): {error}")
+
+try:
+    profiles = json.loads(sys.argv[3])
+except json.JSONDecodeError as error:
+    raise SystemExit(f"WORKSPACE_RESOURCE_PROFILES_JSON is invalid JSON: {error}")
+for name in ("STANDARD", "HIGH_MEMORY", "GPU"):
+    value = profiles.get(name)
+    if not isinstance(value, dict) or not isinstance(value.get("requests"), dict) or not isinstance(value.get("limits"), dict):
+        raise SystemExit(f"WORKSPACE_RESOURCE_PROFILES_JSON is missing {name} requests/limits")
 PY
 
 for resource in \
@@ -79,7 +90,9 @@ for resource in \
   "configmap/$router_configmap" \
   "secret/$router_secret" \
   "secret/watcher-harbor-registry-secret" \
-  "persistentvolumeclaim/jcode-vol-pvc"; do
+  "persistentvolumeclaim/jcode-vol-pvc" \
+  "persistentvolumeclaim/jcode-starter-pvc" \
+  "persistentvolumeclaim/jcode-archive-pvc"; do
   case "$resource" in
     crd/*|clustersecretstore/*) kubectl get "$resource" >/dev/null ;;
     *) kubectl get "$resource" -n "$namespace" >/dev/null ;;
@@ -150,9 +163,10 @@ jq -n \
   --arg workspace_init_image "harbor.jbnu.ac.kr/jdevops/workspace-init@$workspace_init_digest" \
   --arg watcher_api_base "$watcher_api_base" \
   --arg workspace_dns_cidrs "$workspace_dns_cidrs" \
+  --arg workspace_resource_profiles_json "$workspace_resource_profiles_json" \
   --arg watcher_namespace "$watcher_namespace" \
   --arg workspace_proxy_namespace "$workspace_proxy_namespace" \
-  '{data:{CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base,WORKSPACE_DNS_CIDRS:$workspace_dns_cidrs,WATCHER_NAMESPACE:$watcher_namespace,WORKSPACE_PROXY_NAMESPACE:$workspace_proxy_namespace,WORKSPACE_PROXY_POD_LABEL:"jcode-router",WORKSPACE_PROXY_PORT:"3000"}}' \
+  '{data:{CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base,WORKSPACE_DNS_CIDRS:$workspace_dns_cidrs,WORKSPACE_RESOURCE_PROFILES_JSON:$workspace_resource_profiles_json,WATCHER_NAMESPACE:$watcher_namespace,WORKSPACE_PROXY_NAMESPACE:$workspace_proxy_namespace,WORKSPACE_PROXY_POD_LABEL:"jcode-router",WORKSPACE_PROXY_PORT:"3000"}}' \
   > "$config_patch"
 kubectl patch configmap "$generator_configmap" -n "$namespace" --type=merge --patch-file "$config_patch"
 kubectl apply -f "$render_dir/platform.yaml"

@@ -56,9 +56,20 @@ verify_workload() {
   done < <(jq -r --arg container "$container" '.items[].status.containerStatuses[]? | select(.name == $container) | .imageID' <<<"$pods")
 }
 
+verify_cronjob_image() {
+  local namespace=$1 name=$2 container=$3 image=$4 expected=$5 spec_image
+  spec_image=$(kubectl get cronjob "$name" -n "$namespace" -o json | jq -er --arg container "$container" \
+    '.spec.jobTemplate.spec.template.spec.containers[] | select(.name == $container) | .image')
+  [[ "$spec_image" == "$image@$expected" ]] || {
+    echo "$namespace/cronjob/$name uses $spec_image, expected $image@$expected" >&2
+    exit 1
+  }
+}
+
 registry=harbor.jbnu.ac.kr/jdevops
 verify_workload deployment "$jcode_namespace" jcode-bootstrap bootstrap "$registry/jcode-generator" "$(digest_for generator)"
 verify_workload deployment "$jcode_namespace" jcode-generator jcode-generator "$registry/jcode-generator" "$(digest_for generator)"
+verify_cronjob_image "$jcode_namespace" jcode-archive-cleanup cleanup "$registry/jcode-generator" "$(digest_for generator)"
 verify_workload deployment "$jcode_namespace" jcode-router jcode-router "$registry/jcode-router" "$(digest_for router)"
 verify_workload deployment "$jcode_namespace" squid-exporter squid-exporter "$registry/squid-exporter" "$(digest_for squid_exporter)"
 verify_workload deployment "$watcher_namespace" watcher-backend watcher-backend "$registry/watcher-backend" "$(digest_for watcher_backend)"
