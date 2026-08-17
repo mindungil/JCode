@@ -55,6 +55,7 @@ jobs:
           bash -n deploy/test-followup-scripts.sh
           deploy/test-followup-scripts.sh
           bash -n deploy/deploy.sh
+          python3 -m unittest deploy/test_reconcile_workspace_dns.py
           jq -e '
             .schema == 1 and
             .environments.dev["jcode-dev-1"].action == "quarantine" and
@@ -73,6 +74,9 @@ jobs:
           grep -q 'mountPath: /nfs-data' deploy/base/workspace-controller.yaml
           grep -q 'claimName: jcode-vol-pvc' deploy/base/workspace-controller.yaml
           grep -q 'WATCHER_API_BASE' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'WORKSPACE_DNS_CIDRS: "169.254.25.10/32"' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'WORKSPACE_DNS_CIDRS' deploy/deploy.sh
+          grep -q 'reconcile_workspace_dns.py' deploy/deploy.sh
           grep -q 'watcher-backend-service.dev.svc.cluster.local:3000' deploy/deploy.sh
           grep -q 'watcher-backend-service.watcher.svc.cluster.local:3000' deploy/deploy.sh
           grep -Fq "ALLOWED_NETWORK_CIDR=\"\$allowed_network_cidr\"" deploy/deploy.sh
@@ -229,6 +233,7 @@ jobs:
           assert names.index("Validate production smoke course") < names.index("Prepare controller permissions")
           deploy_step = next(step for step in steps if step.get("name") == "Deploy Generator and Router second")
           assert "SQUID_ALLOWED_NETWORK_CIDR" in deploy_step["env"]["ALLOWED_NETWORK_CIDR"]
+          assert "WORKSPACE_DNS_CIDRS" in deploy_step["env"]
           revision_step = next(step for step in steps if step.get("name") == "Verify component revisions")
           revision_script = revision_step["with"]["script"]
           assert "for (const [repo, ref] of revisions)" in revision_script
