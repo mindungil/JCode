@@ -206,6 +206,26 @@ def test_workspace_dns_cidrs_reject_missing_or_invalid_values(generator, monkeyp
         generator.get_workspace_dns_cidrs()
 
 
+@pytest.mark.parametrize("value", [None, "169.254.25.10", "not-a-cidr"])
+def test_bootstrap_startup_rejects_missing_or_invalid_dns_cidrs(generator, monkeypatch, value):
+    monkeypatch.setattr(generator, "CONTROLLER_MODE", "bootstrap")
+    monkeypatch.setattr(generator, "EXTERNAL_SECRET_STORE_NAME", "jcode-harbor-pull-secret")
+    monkeypatch.setenv("IMAGE_PULL_SECRET_NAMES", "watcher-harbor-registry-secret")
+    if value is None:
+        monkeypatch.delenv("WORKSPACE_DNS_CIDRS", raising=False)
+    else:
+        monkeypatch.setenv("WORKSPACE_DNS_CIDRS", value)
+
+    with pytest.raises(RuntimeError, match="WORKSPACE_DNS_CIDRS"):
+        generator.validate_on_startup()
+
+
+def test_workspace_pod_uses_short_dns_search_threshold(generator):
+    dns_config = generator.get_pod_dns_config()
+
+    assert [(option.name, option.value) for option in dns_config.options] == [("ndots", "2")]
+
+
 def test_workspace_scheduling_config_is_parsed(generator, monkeypatch):
     monkeypatch.setenv("WORKSPACE_NODE_SELECTOR", '{"env":"dev"}')
     monkeypatch.setenv(

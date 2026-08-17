@@ -122,6 +122,12 @@ def get_workspace_tolerations() -> Optional[list[client.V1Toleration]]:
         for item in value
     ] or None
 
+
+def get_pod_dns_config() -> client.V1PodDNSConfig:
+    return client.V1PodDNSConfig(
+        options=[client.V1PodDNSConfigOption(name="ndots", value="2")]
+    )
+
 # 요청 바디 모델 정의
 class DeployRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -476,6 +482,7 @@ def validate_runtime_configuration():
         missing = [name for name, value in required.items() if not str(value).strip()]
         if missing:
             raise RuntimeError(f"Bootstrap 필수 환경값이 누락되었습니다: {', '.join(missing)}")
+        get_workspace_dns_cidrs()
         get_image_pull_secret_remote_names()
 
 
@@ -761,6 +768,7 @@ def create_deployment(apps_v1_api, namespace: str, deployment_name: str, app_lab
                 spec=client.V1PodSpec(
                     service_account_name=SERVICE_ACCOUNT,
                     automount_service_account_token=False,
+                    dns_config=get_pod_dns_config(),
                     node_selector=get_workspace_node_selector(),
                     tolerations=get_workspace_tolerations(),
                     security_context=client.V1PodSecurityContext(

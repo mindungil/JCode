@@ -42,7 +42,7 @@ code_server_vnc_digest=${CODE_SERVER_VNC_DIGEST:?CODE_SERVER_VNC_DIGEST is requi
 workspace_init_digest=${WORKSPACE_INIT_DIGEST:?WORKSPACE_INIT_DIGEST is required}
 squid_exporter_digest=${SQUID_EXPORTER_DIGEST:?SQUID_EXPORTER_DIGEST is required}
 allowed_network_cidr=${ALLOWED_NETWORK_CIDR:?ALLOWED_NETWORK_CIDR is required}
-workspace_dns_cidrs=${WORKSPACE_DNS_CIDRS:-169.254.25.10/32}
+workspace_dns_cidrs=${WORKSPACE_DNS_CIDRS:?WORKSPACE_DNS_CIDRS is required}
 
 for digest in "$generator_digest" "$router_digest" "$code_server_digest" "$code_server_vnc_digest" "$workspace_init_digest" "$squid_exporter_digest"; do
   if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
