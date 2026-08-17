@@ -183,6 +183,29 @@ def test_workspace_watcher_api_default_follows_dev_environment(generator, monkey
     assert values["WATCHER_API_BASE"] == "http://watcher-backend-service.dev.svc.cluster.local:3000"
 
 
+def test_workspace_dns_peers_include_nodelocal_dns(generator, monkeypatch):
+    monkeypatch.setenv(
+        "WORKSPACE_DNS_CIDRS",
+        "169.254.25.10/32, 10.96.0.10/32, 169.254.25.10/32",
+    )
+
+    peers = generator.build_workspace_dns_peers()
+
+    assert peers[0].pod_selector.match_labels == {"k8s-app": "kube-dns"}
+    assert [peer.ip_block.cidr for peer in peers[1:]] == [
+        "169.254.25.10/32",
+        "10.96.0.10/32",
+    ]
+
+
+@pytest.mark.parametrize("value", ["", "169.254.25.10", "not-a-cidr"])
+def test_workspace_dns_cidrs_reject_missing_or_invalid_values(generator, monkeypatch, value):
+    monkeypatch.setenv("WORKSPACE_DNS_CIDRS", value)
+
+    with pytest.raises(RuntimeError, match="WORKSPACE_DNS_CIDRS"):
+        generator.get_workspace_dns_cidrs()
+
+
 def test_workspace_scheduling_config_is_parsed(generator, monkeypatch):
     monkeypatch.setenv("WORKSPACE_NODE_SELECTOR", '{"env":"dev"}')
     monkeypatch.setenv(

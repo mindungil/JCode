@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import re
@@ -162,6 +163,40 @@ class SmokeWorkspaceRequest(BaseModel):
 def parse_csv_env(name: str) -> list[str]:
     value = os.getenv(name, "")
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def get_workspace_dns_cidrs() -> list[str]:
+    configured = parse_csv_env("WORKSPACE_DNS_CIDRS")
+    if not configured:
+        raise RuntimeError("WORKSPACE_DNS_CIDRS를 하나 이상의 CIDR로 설정해야 합니다.")
+
+    cidrs = []
+    for value in configured:
+        if "/" not in value:
+            raise RuntimeError(f"WORKSPACE_DNS_CIDRS에 잘못된 CIDR이 있습니다: {value}")
+        try:
+            cidrs.append(str(ipaddress.ip_network(value, strict=True)))
+        except ValueError as exc:
+            raise RuntimeError(f"WORKSPACE_DNS_CIDRS에 잘못된 CIDR이 있습니다: {value}") from exc
+    return list(dict.fromkeys(cidrs))
+
+
+def build_workspace_dns_peers() -> list[client.V1NetworkPolicyPeer]:
+    peers = [
+        client.V1NetworkPolicyPeer(
+            namespace_selector=client.V1LabelSelector(
+                match_labels={"kubernetes.io/metadata.name": "kube-system"}
+            ),
+            pod_selector=client.V1LabelSelector(
+                match_labels={"k8s-app": "kube-dns"}
+            ),
+        )
+    ]
+    peers.extend(
+        client.V1NetworkPolicyPeer(ip_block=client.V1IPBlock(cidr=cidr))
+        for cidr in get_workspace_dns_cidrs()
+    )
+    return peers
 
 
 def get_image_pull_secret_names() -> list[str]:
@@ -1285,16 +1320,7 @@ def init_namespace(core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, cus
             ),
             egress=[
                 client.V1NetworkPolicyEgressRule(
-                    to=[
-                        client.V1NetworkPolicyPeer(
-                            namespace_selector=client.V1LabelSelector(
-                                match_labels={"kubernetes.io/metadata.name": "kube-system"}
-                            ),
-                            pod_selector=client.V1LabelSelector(
-                                match_labels={"k8s-app": "kube-dns"}
-                            ),
-                        )
-                    ],
+                    to=build_workspace_dns_peers(),
                     ports=[
                         client.V1NetworkPolicyPort(port=53, protocol="UDP"),
                         client.V1NetworkPolicyPort(port=53, protocol="TCP"),

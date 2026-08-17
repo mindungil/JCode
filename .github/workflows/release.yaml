@@ -327,6 +327,7 @@ jobs:
           TARGET: ${{ inputs.target }}
           JCODE_NAMESPACE: ${{ vars.JCODE_NAMESPACE }}
           ALLOWED_NETWORK_CIDR: ${{ vars.SQUID_ALLOWED_NETWORK_CIDR }}
+          WORKSPACE_DNS_CIDRS: ${{ vars.WORKSPACE_DNS_CIDRS || '169.254.25.10/32' }}
         run: deploy/deploy.sh "$TARGET"
       - name: Deploy portal Backend third
         env:
