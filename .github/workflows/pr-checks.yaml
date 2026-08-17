@@ -24,6 +24,7 @@ jobs:
           cache-dependency-path: image/squid-exporter/go.mod
       - run: python -m pip install -r generator/requirements.txt pytest
       - run: python -m pytest -q generator/tests
+      - run: python -m py_compile generator/main.py generator/archive_reconcile.py
       - run: go test ./...
         working-directory: image/squid-exporter
       - run: docker build -t jcode-squid-exporter:pr image/squid-exporter
@@ -73,6 +74,11 @@ jobs:
           grep -q 'name: NFS_MOUNT_PATH' deploy/base/workspace-controller.yaml
           grep -q 'mountPath: /nfs-data' deploy/base/workspace-controller.yaml
           grep -q 'claimName: jcode-vol-pvc' deploy/base/workspace-controller.yaml
+          grep -q 'claimName: jcode-starter-pvc' deploy/base/workspace-controller.yaml
+          grep -q 'claimName: jcode-archive-pvc' deploy/base/workspace-controller.yaml
+          grep -q 'WORKSPACE_RESOURCE_PROFILES_JSON' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'name: jcode-archive-cleanup' deploy/base/archive-cleanup.yaml
+          grep -q 'verify_cronjob_image' deploy/verify-release-images.sh
           grep -q 'WATCHER_API_BASE' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'WORKSPACE_DNS_CIDRS' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'WORKSPACE_DNS_CIDRS' deploy/deploy.sh
