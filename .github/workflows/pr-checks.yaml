@@ -51,6 +51,9 @@ jobs:
           bash -n deploy/verify-release-images.sh
           bash -n deploy/install-cluster-v2.sh
           bash -n deploy/cutover-dev.sh
+          bash -n deploy/update-backend-generator-config.sh
+          bash -n deploy/test-followup-scripts.sh
+          deploy/test-followup-scripts.sh
           bash -n deploy/deploy.sh
           jq -e '
             .schema == 1 and
@@ -112,6 +115,11 @@ jobs:
           grep -q 'migrate-workspace-rbac.sh prod' deploy/install-cluster-v2.sh
           grep -q 'finalize-workspace-rbac.sh prod' deploy/install-cluster-v2.sh
           grep -q 'jcode-generator-dev' deploy/finalize-workspace-rbac.sh
+          grep -q 'unsafe_legacy_cluster_bindings' deploy/finalize-workspace-rbac.sh
+          grep -q 'remaining_cluster_bindings' deploy/finalize-workspace-rbac.sh
+          grep -q 'update-backend-generator-config.sh' deploy/cutover-dev.sh
+          if sed -n '/^on:/,/^permissions:/p' .github/workflows/images.yaml | grep -q '^  push:'; then exit 1; fi
+          grep -q 'push: false' .github/workflows/images.yaml
           grep -q 'legacy_rolebinding' generator/namespace_reconcile.py
           grep -q 'jcode-validated-release-manifest' .github/workflows/release.yaml
           grep -q 'ref:.*steps.release_manifest.outputs.jcode_ref' .github/workflows/cutover-dev.yaml
@@ -234,3 +242,30 @@ jobs:
           trap '"$kind_bin" delete cluster --name jcode-policy' EXIT
           "$kind_bin" create cluster --name jcode-policy --image kindest/node:v1.32.2
           deploy/test-course-metadata-policy.sh
+          kubectl delete namespace dev watcher --ignore-not-found --wait=true
+          kubectl create namespace dev
+          kubectl create namespace watcher
+          kubectl apply -f - <<'EOF'
+          apiVersion: apiextensions.k8s.io/v1
+          kind: CustomResourceDefinition
+          metadata:
+            name: servicemonitors.monitoring.coreos.com
+          spec:
+            group: monitoring.coreos.com
+            names:
+              kind: ServiceMonitor
+              plural: servicemonitors
+              singular: servicemonitor
+            scope: Namespaced
+            versions:
+              - name: v1
+                served: true
+                storage: true
+                schema:
+                  openAPIV3Schema:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+          EOF
+          kubectl apply --server-side --dry-run=server -f /tmp/jcode-cluster.yaml >/dev/null
+          kubectl apply --server-side --dry-run=server -f /tmp/jcode-dev.yaml >/dev/null
+          kubectl apply --server-side --dry-run=server -f /tmp/jcode-prod.yaml >/dev/null
