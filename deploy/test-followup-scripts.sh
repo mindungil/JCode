@@ -147,14 +147,14 @@ export MOCK_CONFIG="$config_file"
 for _ in 1 2; do
   BACKEND_NAMESPACE=dev \
     BACKEND_CONFIGMAP=jcode-backend-config \
-    GENERATOR_BOOTSTRAP_URL=http://jcode-bootstrap-svc.dev.svc.cluster.local:5000 \
-    GENERATOR_WORKSPACE_URL=http://jcode-generator-svc.dev.svc.cluster.local:5000 \
+    GENERATOR_BOOTSTRAP_URL=http://jcode-bootstrap-svc:5000 \
+    GENERATOR_WORKSPACE_URL=http://jcode-generator-svc:5000 \
     "$repo_root/deploy/update-backend-generator-config.sh"
 done
 
 jq -e '
-  .data.GENERATOR_BOOTSTRAP_URL == "http://jcode-bootstrap-svc.dev.svc.cluster.local:5000" and
-  .data.GENERATOR_WORKSPACE_URL == "http://jcode-generator-svc.dev.svc.cluster.local:5000" and
+  .data.GENERATOR_BOOTSTRAP_URL == "http://jcode-bootstrap-svc:5000" and
+  .data.GENERATOR_WORKSPACE_URL == "http://jcode-generator-svc:5000" and
   .data.KEEP == "value" and
   (.data | has("GENERATOR_URL") | not)
 ' "$config_file" >/dev/null

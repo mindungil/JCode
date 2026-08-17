@@ -74,7 +74,7 @@ jobs:
           grep -q 'mountPath: /nfs-data' deploy/base/workspace-controller.yaml
           grep -q 'claimName: jcode-vol-pvc' deploy/base/workspace-controller.yaml
           grep -q 'WATCHER_API_BASE' generator/k8s/jcode-generator-val-ex.yaml
-          grep -q 'WORKSPACE_DNS_CIDRS: "169.254.25.10/32"' generator/k8s/jcode-generator-val-ex.yaml
+          grep -q 'WORKSPACE_DNS_CIDRS' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'WORKSPACE_DNS_CIDRS' deploy/deploy.sh
           grep -q 'reconcile_workspace_dns.py' deploy/deploy.sh
           grep -q 'watcher-backend-service.dev.svc.cluster.local:3000' deploy/deploy.sh
@@ -177,6 +177,7 @@ jobs:
           assert deployments["jcode-generator"]["spec"]["replicas"] == 2
           assert deployments["jcode-generator"]["spec"]["template"]["spec"]["topologySpreadConstraints"]
           for name in ("jcode-bootstrap", "jcode-generator"):
+              assert deployments[name]["spec"]["template"]["spec"]["dnsConfig"]["options"] == [{"name": "ndots", "value": "2"}]
               security = deployments[name]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
               assert security["runAsNonRoot"] is True
               assert security["runAsUser"] == 1000
@@ -234,6 +235,9 @@ jobs:
           deploy_step = next(step for step in steps if step.get("name") == "Deploy Generator and Router second")
           assert "SQUID_ALLOWED_NETWORK_CIDR" in deploy_step["env"]["ALLOWED_NETWORK_CIDR"]
           assert "WORKSPACE_DNS_CIDRS" in deploy_step["env"]
+          assert "169.254.25.10/32" not in deploy_step["env"]["WORKSPACE_DNS_CIDRS"]
+          validate_step = next(step for step in steps if step.get("name") == "Validate deployment inputs")
+          assert "WORKSPACE_DNS_CIDRS" in validate_step["env"]
           revision_step = next(step for step in steps if step.get("name") == "Verify component revisions")
           revision_script = revision_step["with"]["script"]
           assert "for (const [repo, ref] of revisions)" in revision_script

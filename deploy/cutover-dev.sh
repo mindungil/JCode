@@ -112,8 +112,8 @@ BOOTSTRAP_URL=http://127.0.0.1:15000 \
 
 BACKEND_NAMESPACE="$backend_namespace" \
   BACKEND_CONFIGMAP="$backend_configmap" \
-  GENERATOR_BOOTSTRAP_URL=http://jcode-bootstrap-svc.dev.svc.cluster.local:5000 \
-  GENERATOR_WORKSPACE_URL=http://jcode-generator-svc.dev.svc.cluster.local:5000 \
+  GENERATOR_BOOTSTRAP_URL=http://jcode-bootstrap-svc:5000 \
+  GENERATOR_WORKSPACE_URL=http://jcode-generator-svc:5000 \
   "$backend_config_script"
 kubectl rollout restart "deployment/$backend_deployment" -n "$backend_namespace"
 kubectl rollout status "deployment/$backend_deployment" -n "$backend_namespace" --timeout=5m
