@@ -116,6 +116,9 @@ spec:
     - podSelector:
         matchLabels:
           app: jcode-backend
+    - podSelector:
+        matchLabels:
+          app: jcode-assignment-path-backfill
     ports:
     - protocol: TCP
       port: 5000

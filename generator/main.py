@@ -1757,6 +1757,25 @@ async def create_namespace_api(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/namespace/{ns}")
+async def get_namespace_status(
+    ns: str,
+    course_id: int,
+    token_payload: dict = Depends(require_service_scope("namespace:read", "bootstrap")),
+):
+    """Backfill 전에 Namespace 존재 여부와 강의 소유권을 확인합니다."""
+    namespace = resolve_namespace(ns)
+    core_v1_api = client.CoreV1Api()
+    try:
+        core_v1_api.read_namespace(name=namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"exists": False, "namespace": namespace}
+        raise
+    verify_course_namespace(core_v1_api, namespace, course_id)
+    return {"exists": True, "namespace": namespace}
+
+
 def wait_for_namespace_deleted(
     core_v1_api,
     namespace: str,
