@@ -85,6 +85,8 @@ jobs:
           grep -q 'reconcile_workspace_dns.py' deploy/deploy.sh
           grep -q 'watcher-backend-service.dev.svc.cluster.local:3000' deploy/deploy.sh
           grep -q 'watcher-backend-service.watcher.svc.cluster.local:3000' deploy/deploy.sh
+          grep -Fq 'workspace_proxy_url="http://jcode-router-svc.${namespace}.svc.cluster.local:3000"' deploy/deploy.sh
+          grep -q 'WORKSPACE_PROXY_URL:\$workspace_proxy_url' deploy/deploy.sh
           grep -Fq "ALLOWED_NETWORK_CIDR=\"\$allowed_network_cidr\"" deploy/deploy.sh
           grep -q 'router/k8s/configure-squid.sh' deploy/deploy.sh
           grep -q 'acl cache_manager urlpath_regex' router/k8s/configure-squid.sh
