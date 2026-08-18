@@ -6,10 +6,10 @@
 
 1. 병합된 DNS 기준선 이미지를 dev에 적용하고 `ndots:2`, 내부 서비스 짧은 주소, Workspace DNS CIDR을 확인합니다.
 2. 같은 Generator·Backend digest를 production에 적용해 기준선을 고정합니다.
-3. Backend DB migration을 먼저 수행합니다. 기존 `vnc=false`는 `ALGORITHM`, `vnc=true`는 `LAB`으로 변환됩니다.
-4. Starter·archive PVC를 준비하고 새 Generator를 배포합니다.
-5. Backend를 배포하면 기존 과제 경로의 `assignment-{id}` 전환 작업이 자동 등록됩니다.
-6. migration 작업이 모두 성공한 뒤 Frontend를 배포합니다.
+3. Starter·archive PVC를 먼저 준비하고 새 Generator를 배포합니다.
+4. Backend를 배포해 Flyway migration을 수행합니다. 기존 `vnc=false`는 `ALGORITHM`, `vnc=true`는 `LAB`으로 변환되고 과제 경로 전환 작업이 등록됩니다.
+5. 기존 과제의 `assignment-{id}` 전환 operation이 모두 성공했는지 확인합니다.
+6. operation 완료 후 Frontend를 배포합니다.
 
 환경 프로필 → 과제 식별자 → 스타터 원본 → 삭제·보관 순서는 바꾸지 않습니다.
 

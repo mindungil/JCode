@@ -24,7 +24,7 @@ spec:
             fsGroupChangePolicy: OnRootMismatch
           containers:
           - name: cleanup
-            image: harbor.jbnu.ac.kr/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
+            image: harbor.jedutools.io/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA
             imagePullPolicy: IfNotPresent
             command: ["python", "/app/archive_reconcile.py", "--apply"]
             env:

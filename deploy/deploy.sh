@@ -36,6 +36,11 @@ if [[ "$namespace" != "$default_namespace" ]]; then
   exit 2
 fi
 workspace_proxy_url="http://jcode-router-svc.${namespace}.svc.cluster.local:3000"
+harbor_registry=${HARBOR_REGISTRY:-harbor.jedutools.io}
+if [[ ! "$harbor_registry" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$ ]]; then
+  echo "HARBOR_REGISTRY must be a registry host without scheme or path: $harbor_registry" >&2
+  exit 2
+fi
 generator_digest=${GENERATOR_DIGEST:?GENERATOR_DIGEST is required}
 router_digest=${ROUTER_DIGEST:?ROUTER_DIGEST is required}
 code_server_digest=${CODE_SERVER_DIGEST:?CODE_SERVER_DIGEST is required}
@@ -133,24 +138,24 @@ ROUTER_NAMESPACE="$namespace" HTTP_PORT=3000 ALLOWED_NETWORK_CIDR="$allowed_netw
 render_dir=$(mktemp -d)
 trap 'rm -rf "$render_dir"' EXIT
 kubectl kustomize "deploy/overlays/$overlay" > "$render_dir/platform.yaml"
-python3 - "$generator_digest" "$router_digest" "$squid_exporter_digest" "$render_dir/platform.yaml" <<'PY'
+python3 - "$generator_digest" "$router_digest" "$squid_exporter_digest" "$harbor_registry" "$render_dir/platform.yaml" <<'PY'
 import sys
 from pathlib import Path
 
-generator_digest, router_digest, squid_exporter_digest, output = sys.argv[1:]
+generator_digest, router_digest, squid_exporter_digest, harbor_registry, output = sys.argv[1:]
 path = Path(output)
 content = path.read_text(encoding="utf-8")
 content = content.replace(
-    "harbor.jbnu.ac.kr/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA",
-    f"harbor.jbnu.ac.kr/jdevops/jcode-generator@{generator_digest}",
+    "harbor.jedutools.io/jdevops/jcode-generator:REPLACE_WITH_COMMIT_SHA",
+    f"{harbor_registry}/jdevops/jcode-generator@{generator_digest}",
 )
 content = content.replace(
-    "harbor.jbnu.ac.kr/jdevops/jcode-router:REPLACE_WITH_COMMIT_SHA",
-    f"harbor.jbnu.ac.kr/jdevops/jcode-router@{router_digest}",
+    "harbor.jedutools.io/jdevops/jcode-router:REPLACE_WITH_COMMIT_SHA",
+    f"{harbor_registry}/jdevops/jcode-router@{router_digest}",
 )
 content = content.replace(
-    "harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA",
-    f"harbor.jbnu.ac.kr/jdevops/squid-exporter@{squid_exporter_digest}",
+    "harbor.jedutools.io/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA",
+    f"{harbor_registry}/jdevops/squid-exporter@{squid_exporter_digest}",
 )
 if "REPLACE_WITH_COMMIT_SHA" in content:
     raise SystemExit("rendered manifest contains an unresolved image placeholder")
@@ -159,16 +164,17 @@ PY
 
 config_patch="$render_dir/generator-images.json"
 jq -n \
-  --arg code_server_image "harbor.jbnu.ac.kr/jdevops/code-server@$code_server_digest" \
-  --arg code_server_vnc_image "harbor.jbnu.ac.kr/jdevops/code-server-vnc@$code_server_vnc_digest" \
-  --arg workspace_init_image "harbor.jbnu.ac.kr/jdevops/workspace-init@$workspace_init_digest" \
+  --arg harbor_registry "$harbor_registry" \
+  --arg code_server_image "$harbor_registry/jdevops/code-server@$code_server_digest" \
+  --arg code_server_vnc_image "$harbor_registry/jdevops/code-server-vnc@$code_server_vnc_digest" \
+  --arg workspace_init_image "$harbor_registry/jdevops/workspace-init@$workspace_init_digest" \
   --arg watcher_api_base "$watcher_api_base" \
   --arg workspace_dns_cidrs "$workspace_dns_cidrs" \
   --arg workspace_resource_profiles_json "$workspace_resource_profiles_json" \
   --arg workspace_proxy_url "$workspace_proxy_url" \
   --arg watcher_namespace "$watcher_namespace" \
   --arg workspace_proxy_namespace "$workspace_proxy_namespace" \
-  '{data:{CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base,WORKSPACE_DNS_CIDRS:$workspace_dns_cidrs,WORKSPACE_RESOURCE_PROFILES_JSON:$workspace_resource_profiles_json,WORKSPACE_PROXY_URL:$workspace_proxy_url,WATCHER_NAMESPACE:$watcher_namespace,WORKSPACE_PROXY_NAMESPACE:$workspace_proxy_namespace,WORKSPACE_PROXY_POD_LABEL:"jcode-router",WORKSPACE_PROXY_PORT:"3000"}}' \
+  '{data:{HARBOR_REGISTRY:$harbor_registry,CODE_SERVER_IMAGE:$code_server_image,CODE_SERVER_VNC_IMAGE:$code_server_vnc_image,WORKSPACE_INIT_IMAGE:$workspace_init_image,WATCHER_API_BASE:$watcher_api_base,WORKSPACE_DNS_CIDRS:$workspace_dns_cidrs,WORKSPACE_RESOURCE_PROFILES_JSON:$workspace_resource_profiles_json,WORKSPACE_PROXY_URL:$workspace_proxy_url,WATCHER_NAMESPACE:$watcher_namespace,WORKSPACE_PROXY_NAMESPACE:$workspace_proxy_namespace,WORKSPACE_PROXY_POD_LABEL:"jcode-router",WORKSPACE_PROXY_PORT:"3000"}}' \
   > "$config_patch"
 kubectl patch configmap "$generator_configmap" -n "$namespace" --type=merge --patch-file "$config_patch"
 kubectl apply -f "$render_dir/platform.yaml"

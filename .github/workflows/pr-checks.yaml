@@ -95,7 +95,9 @@ jobs:
           if grep -R -nE '(^|[[:space:]])image:[[:space:]]+([^/[:space:]]+/)?[^[:space:]]+:latest|image="busybox"' generator router; then exit 1; fi
           grep -q 'WORKSPACE_INIT_IMAGE' generator/k8s/jcode-generator-val-ex.yaml
           grep -q 'volumeHandle' generator/k8s/configure-workspace-storage.sh
-          grep -q 'harbor.jbnu.ac.kr/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' deploy/base/squid-exporter.yaml
+          grep -q 'harbor.jedutools.io/jdevops/squid-exporter:REPLACE_WITH_COMMIT_SHA' deploy/base/squid-exporter.yaml
+          grep -q 'HARBOR_REGISTRY' deploy/deploy.sh
+          if grep -R -n 'harbor\.jbnu\.ac\.kr' --exclude-dir=.git --exclude-dir=__pycache__ --exclude='*.pyc' .; then exit 1; fi
           jq -e '.schema == 3 and .environment == "dev" and (.revisions | length == 5) and (.digests | length == 12)' deploy/release-manifest.example.json >/dev/null
           grep -q "const port = Number.parseInt(process.env.PORT || '3001', 10);" router/server.js
           if grep -nEi 'refresh token extracted|Access token refreshed.*token|Token Verified Successfully.*, decoded|token refresh:.*,[[:space:]]*err[[:space:]]*\)' router/server.js; then exit 1; fi

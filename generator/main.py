@@ -74,6 +74,7 @@ WORKSPACE_PROXY_URL = os.getenv("WORKSPACE_PROXY_URL", "").strip()
 WORKSPACE_PROXY_NAMESPACE = os.getenv("WORKSPACE_PROXY_NAMESPACE", "").strip()
 WORKSPACE_PROXY_POD_LABEL = os.getenv("WORKSPACE_PROXY_POD_LABEL", "").strip()
 WORKSPACE_PROXY_PORT = int(os.getenv("WORKSPACE_PROXY_PORT", "3000"))
+DEFAULT_HARBOR_REGISTRY = "harbor.jedutools.io"
 WORKSPACE_NO_PROXY = os.getenv(
     "WORKSPACE_NO_PROXY",
     "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local",
@@ -371,11 +372,19 @@ def get_immutable_harbor_image(name: str) -> str:
     return validate_immutable_harbor_image(name, image)
 
 
+def get_harbor_registry() -> str:
+    registry = os.getenv("HARBOR_REGISTRY", DEFAULT_HARBOR_REGISTRY).strip().lower().rstrip("/")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[1-9][0-9]{0,4})?", registry):
+        raise RuntimeError("HARBOR_REGISTRY는 scheme과 경로 없는 registry host여야 합니다.")
+    return registry
+
+
 def validate_immutable_harbor_image(name: str, image: str) -> str:
     if not image:
         raise RuntimeError(f"{name}를 Harbor 이미지로 설정해야 합니다.")
-    if not image.startswith("harbor.jbnu.ac.kr/"):
-        raise RuntimeError(f"{name}는 harbor.jbnu.ac.kr 이미지여야 합니다: {image}")
+    registry = get_harbor_registry()
+    if not image.startswith(f"{registry}/"):
+        raise RuntimeError(f"{name}는 {registry} 이미지여야 합니다: {image}")
     mutable_tag = image.endswith((":latest", ":test", ":v2", ":v2-test"))
     digest_pinned = bool(re.search(r"@sha256:[0-9a-f]{64}$", image))
     commit_tagged = bool(re.search(r":[^/@]*[0-9a-f]{7,40}(?:[-._][^/]*)?$", image))

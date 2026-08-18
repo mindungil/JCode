@@ -4,6 +4,11 @@ set -euo pipefail
 manifest=${1:?release manifest path is required}
 target=${2:?target must be dev or production}
 [[ -f "$manifest" ]]
+harbor_registry=${HARBOR_REGISTRY:-harbor.jedutools.io}
+[[ "$harbor_registry" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$ ]] || {
+  echo "HARBOR_REGISTRY must be a registry host without scheme or path: $harbor_registry" >&2
+  exit 2
+}
 case "$target" in
   dev)
     jcode_namespace=dev
@@ -66,7 +71,7 @@ verify_cronjob_image() {
   }
 }
 
-registry=harbor.jbnu.ac.kr/jdevops
+registry="$harbor_registry/jdevops"
 verify_workload deployment "$jcode_namespace" jcode-bootstrap bootstrap "$registry/jcode-generator" "$(digest_for generator)"
 verify_workload deployment "$jcode_namespace" jcode-generator jcode-generator "$registry/jcode-generator" "$(digest_for generator)"
 verify_cronjob_image "$jcode_namespace" jcode-archive-cleanup cleanup "$registry/jcode-generator" "$(digest_for generator)"
