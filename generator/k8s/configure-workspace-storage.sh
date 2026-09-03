@@ -23,9 +23,12 @@ if [[ -z "$nfs_server" || -z "$nfs_path" ]]; then
     echo "PVC must use an NFS PV or a Longhorn RWX volume" >&2
     exit 1
   fi
-  nfs_server="${volume_handle}.longhorn-system.svc.cluster.local"
+  nfs_server=$(kubectl get service "$volume_handle" -n longhorn-system -o jsonpath='{.spec.clusterIP}')
   nfs_path="/${volume_handle}"
-  kubectl get service "$volume_handle" -n longhorn-system >/dev/null
+  if [[ -z "$nfs_server" || "$nfs_server" == None ]]; then
+    echo "Longhorn RWX share-manager Service must have a ClusterIP" >&2
+    exit 1
+  fi
 fi
 
 patch=$(jq -n \

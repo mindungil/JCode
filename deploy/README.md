@@ -124,6 +124,7 @@ dev overlay는 기존 `jcode-generator-dev-*`, `jcode-router-dev-*` ConfigMap과
    ```
 
 Router ConfigMap의 `CORS_ORIGIN`과 `COOKIE_DOMAIN`은 예시값을 그대로 쓰지 말고 실제 서비스 도메인으로 설정해야 합니다.
+Longhorn RWX Workspace 볼륨은 kubelet의 클러스터 DNS 의존을 피하기 위해 share-manager Service의 현재 ClusterIP를 `NFS_SERVER`로 사용합니다.
 `ALLOWED_NETWORK_CIDR`은 해당 환경의 Workspace Pod 출발지 CIDR로 설정합니다. 배포 스크립트는 이 값으로 `squid-config`를 다시 만들고 cache-manager ACL까지 확인합니다.
 `WORKSPACE_DNS_CIDRS`는 Workspace Pod가 사용하는 DNS 주소를 쉼표로 구분해 반드시 설정합니다. 배포 시 값과 CIDR 형식을 검증한 뒤 Generator ConfigMap에 반영합니다.
 배포가 끝나면 `deploy/reconcile_workspace_dns.py`가 환경이 일치하는 기존 v2 강의 Namespace의 `workspace-egress`도 같은 설정으로 갱신합니다. 강의 metadata 또는 v2 RoleBinding이 없는 기존 Namespace는 변경하지 않습니다.
