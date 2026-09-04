@@ -482,8 +482,23 @@ def get_workspace_extensions_root() -> Path:
     return Path(NFS_MOUNT_PATH) / directory
 
 
+def get_workspace_extension_path(student_num: str) -> Path:
+    if not re.fullmatch(r"[0-9]{1,20}", student_num):
+        raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
+    return get_workspace_extensions_root() / student_num
+
+
 def get_workspace_extension_subpath(student_num: str) -> str:
-    return str(get_workspace_extensions_root().relative_to(Path(NFS_MOUNT_PATH)) / student_num)
+    return str(get_workspace_extension_path(student_num).relative_to(Path(NFS_MOUNT_PATH)))
+
+
+def prepare_workspace_extension(student_num: str) -> Path:
+    validate_nfs_mount()
+    path = get_workspace_extension_path(student_num)
+    reject_symlink_path(path.parent, path)
+    path.mkdir(parents=True, exist_ok=True)
+    os.chown(path, 1000, 1000)
+    return path
 
 
 def get_starter_artifact_root() -> Path:
@@ -1905,6 +1920,7 @@ async def deploy_resources(
             request.workspace_scope,
         )
         verify_course_namespace(core_v1_api, namespace, request.course_id)
+        prepare_workspace_extension(request.student_num)
         ensure_code_server_config(core_v1_api, namespace)
         if request.use_vnc:
             ensure_watcher_hook_config(core_v1_api, namespace)
@@ -2324,15 +2340,12 @@ async def provision_student_workspace(
 ):
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
-    if not re.fullmatch(r"[0-9]{1,20}", request.student_num):
-        raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
-    extensions = get_workspace_extensions_root() / request.student_num
-    for path in (workspace, extensions):
-        reject_symlink_path(path.parent, path)
-        path.mkdir(parents=True, exist_ok=True)
-        os.chown(path, 1000, 1000)
+    prepare_workspace_extension(request.student_num)
+    reject_symlink_path(workspace.parent, workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    os.chown(workspace, 1000, 1000)
     for value in request.workspace_keys:
         assignment_path = workspace / validate_assignment_workspace_key(value)
         reject_symlink_path(workspace, assignment_path)

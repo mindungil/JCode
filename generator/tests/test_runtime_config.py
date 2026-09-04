@@ -204,6 +204,24 @@ def test_workspace_extensions_directory_is_a_safe_single_segment(generator, monk
         generator.get_workspace_extensions_root()
 
 
+def test_workspace_extension_is_prepared_lazily_for_existing_members(generator, monkeypatch, tmp_path):
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(os, "chown", lambda *_: None)
+
+    path = generator.prepare_workspace_extension("20260001")
+
+    assert path == tmp_path / "extensions-v2" / "20260001"
+    assert path.is_dir()
+
+
+def test_workspace_extension_rejects_invalid_student_number(generator, monkeypatch, tmp_path):
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+
+    with pytest.raises(generator.HTTPException, match="student_num"):
+        generator.get_workspace_extension_subpath("../escape")
+
+
 @pytest.mark.parametrize(
     ("file_path", "student_num"),
     [
