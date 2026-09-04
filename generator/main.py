@@ -183,6 +183,7 @@ class AssignmentProvisionRequest(BaseModel):
     namespace: str
     workspace_key: str
     legacy_dir_name: Optional[str] = None
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
 
 class StarterDistributeRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -196,6 +197,7 @@ class AssignmentArchiveRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
     workspace_key: str
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     retention_days: int = Field(default=90, ge=1, le=3650)
     starter_artifact_key: Optional[str] = None
     starter_checksum: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -214,6 +216,7 @@ class StudentProvisionRequest(BaseModel):
     namespace: str
     student_num: str
     workspace_keys: list[str] = Field(default=[])
+    workspace_labels: dict[str, str] = Field(default={})
     artifacts: list[StudentArtifactRef] = Field(default=[])
 
 class StudentArchiveRequest(BaseModel):
@@ -569,6 +572,50 @@ def reject_symlink_path(root: Path, candidate: Path) -> None:
         candidate.resolve(strict=False).relative_to(root)
     except ValueError as error:
         raise HTTPException(status_code=400, detail="관리 경로가 허용 범위를 벗어납니다.") from error
+
+
+def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str, display_name: Optional[str]) -> None:
+    """Keep the stable directory key while showing the configured assignment name in code-server."""
+    if display_name is None:
+        return
+    label = display_name.strip()
+    if not label or len(label) > 50 or any(ord(character) < 32 for character in label):
+        raise HTTPException(status_code=400, detail="display_name 형식이 올바르지 않습니다.")
+    metadata_dir = student_dir / ".jcode"
+    descriptor = metadata_dir / f"{workspace_key}.code-workspace"
+    reject_symlink_path(student_dir, metadata_dir)
+    reject_symlink_path(student_dir, descriptor)
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    if not metadata_dir.is_dir():
+        raise HTTPException(status_code=409, detail="Workspace 메타데이터 경로를 사용할 수 없습니다.")
+    os.chown(metadata_dir, 1000, 1000)
+    payload = {
+        "folders": [{"name": label, "path": f"../{workspace_key}"}],
+    }
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=metadata_dir,
+        prefix=f".{workspace_key}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        json.dump(payload, temporary, ensure_ascii=False, indent=2)
+        temporary.write("\n")
+        temporary_path = Path(temporary.name)
+    try:
+        os.chown(temporary_path, 1000, 1000)
+        os.chmod(temporary_path, 0o640)
+        os.replace(temporary_path, descriptor)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def remove_assignment_workspace_descriptor(student_dir: Path, workspace_key: str) -> None:
+    metadata_dir = student_dir / ".jcode"
+    descriptor = metadata_dir / f"{workspace_key}.code-workspace"
+    reject_symlink_path(student_dir, descriptor)
+    descriptor.unlink(missing_ok=True)
 
 
 def copy_tree_preserving_existing(source: Path, target: Path) -> None:
@@ -2121,14 +2168,15 @@ async def provision_assignment_workspace(
                     status_code=409,
                     detail=f"기존 경로와 새 경로가 함께 존재합니다: {student_dir.name}",
                 )
-            continue
-        if source and source.exists():
-            source.rename(target)
-            migrated += 1
         else:
-            target.mkdir(parents=True, exist_ok=True)
-            created += 1
+            if source and source.exists():
+                source.rename(target)
+                migrated += 1
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+                created += 1
         os.chown(target, 1000, 1000)
+        write_assignment_workspace_descriptor(student_dir, workspace_key, request.display_name)
     return {"workspace_key": workspace_key, "migrated": migrated, "created": created}
 
 
@@ -2223,6 +2271,7 @@ async def archive_assignment_workspace(
             source = final_source
         destination = resolve_below(archive_root, f"{class_div}/{student_dir.name}/{workspace_key}")
         if not source.exists():
+            remove_assignment_workspace_descriptor(student_dir, workspace_key)
             continue
         if destination.exists():
             raise HTTPException(status_code=409, detail=f"보관 경로가 이미 존재합니다: {student_dir.name}")
@@ -2236,6 +2285,7 @@ async def archive_assignment_workspace(
                 "archived_at": int(time.time()),
             },
         )
+        remove_assignment_workspace_descriptor(student_dir, workspace_key)
         archived += 1
     return {"workspace_key": workspace_key, "archived": archived}
 
@@ -2247,6 +2297,7 @@ def move_assignment_between_workspace_and_final_archive(
     restore: bool,
     starter_artifact: Optional[Path] = None,
     starter_overwrite_policy: str = "PRESERVE_EXISTING",
+    display_name: Optional[str] = None,
 ) -> int:
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     archive_root = get_workspace_archive_root()
@@ -2257,12 +2308,17 @@ def move_assignment_between_workspace_and_final_archive(
         source, destination = (final_path, workspace_path) if restore else (workspace_path, final_path)
         if not source.exists():
             if destination.exists():
+                if restore:
+                    write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
+                else:
+                    remove_assignment_workspace_descriptor(student_dir, workspace_key)
                 continue
             if restore:
                 destination.mkdir(parents=True, exist_ok=True)
                 os.chown(destination, 1000, 1000)
                 if starter_artifact is not None:
                     apply_starter_artifact(starter_artifact, destination, starter_overwrite_policy)
+                write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
                 moved += 1
             continue
         if destination.exists():
@@ -2280,6 +2336,10 @@ def move_assignment_between_workspace_and_final_archive(
                     "archived_at": int(time.time()),
                 },
             )
+        if restore:
+            write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
+        else:
+            remove_assignment_workspace_descriptor(student_dir, workspace_key)
         moved += 1
     return moved
 
@@ -2329,6 +2389,7 @@ async def restore_assignment_workspace(
         restore=True,
         starter_artifact=starter_artifact,
         starter_overwrite_policy=request.starter_overwrite_policy,
+        display_name=request.display_name,
     )
     return {"restored": True, "workspace_key": workspace_key, "moved": moved}
 
@@ -2340,17 +2401,22 @@ async def provision_student_workspace(
 ):
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
+    workspace_keys = [validate_assignment_workspace_key(value) for value in request.workspace_keys]
+    unknown_labels = set(request.workspace_labels) - set(workspace_keys)
+    if unknown_labels:
+        raise HTTPException(status_code=400, detail="workspace_labels에 알 수 없는 workspace_key가 있습니다.")
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
     prepare_workspace_extension(request.student_num)
     reject_symlink_path(workspace.parent, workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     os.chown(workspace, 1000, 1000)
-    for value in request.workspace_keys:
-        assignment_path = workspace / validate_assignment_workspace_key(value)
+    for workspace_key in workspace_keys:
+        assignment_path = workspace / workspace_key
         reject_symlink_path(workspace, assignment_path)
         assignment_path.mkdir(parents=True, exist_ok=True)
         os.chown(assignment_path, 1000, 1000)
+        write_assignment_workspace_descriptor(workspace, workspace_key, request.workspace_labels.get(workspace_key))
     applied = 0
     for artifact_ref in request.artifacts:
         workspace_key = validate_assignment_workspace_key(artifact_ref.workspace_key)

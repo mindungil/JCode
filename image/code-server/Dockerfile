@@ -26,8 +26,10 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 
 # ===== JCode UI 커스터마이징 =====
 
-# 1. product.json 교체 (브랜딩: 이름, 텔레메트리 비활성화)
-COPY customization/product.json /usr/lib/code-server/lib/vscode/product.json
+# 1. 기반 이미지의 commit/version/확장 메타데이터를 보존하면서 브랜딩만 병합
+COPY customization/product.json /tmp/jcode-product-overrides.json
+RUN node -e 'const fs=require("fs"); const path="/usr/lib/code-server/lib/vscode/product.json"; const product=JSON.parse(fs.readFileSync(path)); const overrides=JSON.parse(fs.readFileSync("/tmp/jcode-product-overrides.json")); fs.writeFileSync(path, JSON.stringify({...product,...overrides}, null, 2)+"\n"); const merged=JSON.parse(fs.readFileSync(path)); for (const bundle of ["/usr/lib/code-server/lib/vscode/out/server-main.js", "/usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.js"]) { if (!fs.readFileSync(bundle, "utf8").includes(merged.commit)) throw new Error(`product commit ${merged.commit} does not match ${bundle}`); }' && \
+    rm /tmp/jcode-product-overrides.json
 
 # 2. workbench.html 교체 (커스텀 CSS 주입 포인트)
 COPY customization/workbench.html /usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.html

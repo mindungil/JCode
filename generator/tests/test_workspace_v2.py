@@ -107,6 +107,7 @@ def test_assignment_path_migration_is_idempotent(generator, monkeypatch, tmp_pat
         namespace="jcode-os-1",
         workspace_key="assignment-7",
         legacy_dir_name="old-name",
+        display_name="자료구조 첫 과제",
     )
 
     first = asyncio.run(generator.provision_assignment_workspace(request, {}))
@@ -115,6 +116,14 @@ def test_assignment_path_migration_is_idempotent(generator, monkeypatch, tmp_pat
     assert first["migrated"] == 1
     assert second == {"workspace_key": "assignment-7", "migrated": 0, "created": 0}
     assert (student / "assignment-7" / "answer.py").is_file()
+    descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text())
+    assert descriptor == {"folders": [{"name": "자료구조 첫 과제", "path": "../assignment-7"}]}
+
+    renamed = request.model_copy(update={"display_name": "자료구조 수정 과제"})
+    third = asyncio.run(generator.provision_assignment_workspace(renamed, {}))
+    descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text())
+    assert third == {"workspace_key": "assignment-7", "migrated": 0, "created": 0}
+    assert descriptor["folders"][0]["name"] == "자료구조 수정 과제"
 
 
 def test_archive_move_supports_different_filesystems(generator, monkeypatch, tmp_path):
