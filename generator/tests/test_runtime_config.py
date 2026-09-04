@@ -1,4 +1,6 @@
+import asyncio
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,9 +26,109 @@ def test_code_server_args_are_shell_split(generator, monkeypatch):
         "/home/coder/project",
         "--auth",
         "none",
+        "--extensions-dir",
+        "/home/coder/extensions",
         "--restrict-workspace-root",
         "/home/coder/project",
     ]
+
+
+def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, monkeypatch):
+    class AppsV1:
+        def __init__(self):
+            self.deployment = None
+
+        def create_namespaced_deployment(self, namespace, body):
+            self.deployment = body
+
+    monkeypatch.setattr(generator, "get_requested_workspace_image", lambda *_: "harbor/image@sha256:" + "a" * 64)
+    monkeypatch.setattr(generator, "get_workspace_init_image", lambda: "harbor/init@sha256:" + "b" * 64)
+    monkeypatch.setattr(generator, "get_workspace_resources", lambda *_: generator.client.V1ResourceRequirements())
+    monkeypatch.setattr(generator, "get_image_pull_secret_names", lambda: [])
+    apps = AppsV1()
+
+    generator.create_deployment(
+        apps,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001",
+        "workspace/alg-1-20260001",
+        "20260001",
+        False,
+        False,
+    )
+
+    pod_spec = apps.deployment.spec.template.spec
+    init_mounts = pod_spec.init_containers[0].volume_mounts
+    runtime = pod_spec.containers[0]
+    assert any(mount.mount_path == "/home/coder/extensions" for mount in init_mounts)
+    assert any(mount.mount_path == "/home/coder/extensions" for mount in runtime.volume_mounts)
+    assert all(mount.mount_path != "/home/coder/.local" for mount in init_mounts + runtime.volume_mounts)
+    assert "/home/coder/.local" not in " ".join(pod_spec.init_containers[0].command)
+    assert runtime.readiness_probe.tcp_socket.port == 8080
+    assert apps.deployment.spec.progress_deadline_seconds == 600
+
+
+def test_jcode_status_requires_deployment_and_service_endpoint(generator, monkeypatch):
+    deployment = SimpleNamespace(
+        metadata=SimpleNamespace(generation=3),
+        spec=SimpleNamespace(replicas=1),
+        status=SimpleNamespace(
+            conditions=[],
+            observed_generation=3,
+            updated_replicas=1,
+            available_replicas=1,
+            ready_replicas=1,
+        ),
+    )
+    core = SimpleNamespace(
+        read_namespaced_endpoints=lambda *_: SimpleNamespace(
+            subsets=[SimpleNamespace(addresses=[SimpleNamespace(ip="10.0.0.1")])]
+        )
+    )
+    apps = SimpleNamespace(read_namespaced_deployment=lambda *_: deployment)
+    monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
+    monkeypatch.setattr(generator.client, "AppsV1Api", lambda: apps)
+    monkeypatch.setattr(generator, "verify_course_namespace", lambda *_: None)
+
+    result = asyncio.run(generator.get_jcode_status(
+        1,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001-svc",
+        {},
+    ))
+
+    assert result["state"] == "READY"
+
+
+def test_jcode_status_reports_progress_deadline_failure(generator, monkeypatch):
+    deployment = SimpleNamespace(
+        metadata=SimpleNamespace(generation=3),
+        spec=SimpleNamespace(replicas=1),
+        status=SimpleNamespace(
+            conditions=[SimpleNamespace(
+                type="Progressing",
+                status="False",
+                reason="ProgressDeadlineExceeded",
+            )],
+        ),
+    )
+    core = SimpleNamespace()
+    apps = SimpleNamespace(read_namespaced_deployment=lambda *_: deployment)
+    monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
+    monkeypatch.setattr(generator.client, "AppsV1Api", lambda: apps)
+    monkeypatch.setattr(generator, "verify_course_namespace", lambda *_: None)
+
+    result = asyncio.run(generator.get_jcode_status(
+        1,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001-svc",
+        {},
+    ))
+
+    assert result == {"state": "FAILED", "reasonCode": "DEPLOYMENT_PROGRESS_DEADLINE"}
 
 
 def test_workspace_images_must_use_immutable_harbor_reference(generator, monkeypatch):

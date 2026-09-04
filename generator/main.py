@@ -332,6 +332,8 @@ def build_code_server_args(use_vnc: bool) -> list[str]:
             configured[0:0] = ["--bind-addr", "0.0.0.0:8080"]
         if not any(arg == "--auth" or arg.startswith("--auth=") for arg in configured):
             configured.extend(["--auth", "none"])
+    if not any(arg == "--extensions-dir" or arg.startswith("--extensions-dir=") for arg in configured):
+        configured.extend(["--extensions-dir", "/home/coder/extensions"])
     if "--restrict-workspace-root" not in configured:
         configured.extend(["--restrict-workspace-root", get_workspace_root()])
     if get_workspace_root() not in configured:
@@ -915,7 +917,7 @@ def create_deployment(
     init_volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
-            mount_path="/home/coder/.local",
+            mount_path="/home/coder/extensions",
             sub_path=f"extensions/{student_num}"
         )
     ]
@@ -923,7 +925,7 @@ def create_deployment(
     volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
-            mount_path="/home/coder/.local",
+            mount_path="/home/coder/extensions",
             sub_path=f"extensions/{student_num}"
         ),
         client.V1VolumeMount(
@@ -964,7 +966,7 @@ def create_deployment(
     if use_snapshot:
         base_cmd = "\
             chown -R 1000:1000 /home/coder/project && \
-            chown -R 1000:1000 /home/coder/.local"
+            chown -R 1000:1000 /home/coder/extensions"
         init_volume_mounts.append(
             client.V1VolumeMount(
                 name="snapshot-volume",
@@ -1006,7 +1008,7 @@ def create_deployment(
             chown -R 1000:1000 /home/coder/project && \
             {hw_cmd}{prac_cmd} && \
             chown -R 1000:1000 /home/coder/project && \
-            chown -R 1000:1000 /home/coder/.local"
+            chown -R 1000:1000 /home/coder/extensions"
         volume_mount=client.V1VolumeMount(
             name="jcode-vol",
             mount_path="/home/coder/project",
@@ -1055,6 +1057,7 @@ def create_deployment(
         metadata=client.V1ObjectMeta(name=deployment_name, namespace=namespace, labels={"app": app_label}),
         spec=client.V1DeploymentSpec(
             replicas=1,
+            progress_deadline_seconds=600,
             selector=client.V1LabelSelector(match_labels={"app": app_label}),
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
@@ -1086,6 +1089,13 @@ def create_deployment(
                             image_pull_policy=os.getenv("IMAGE_PULL_POLICY", "IfNotPresent"),
                             args=code_server_args,
                             ports=container_ports,  # 동적으로 생성된 containerPort 리스트 적용
+                            readiness_probe=client.V1Probe(
+                                tcp_socket=client.V1TCPSocketAction(port=8080),
+                                initial_delay_seconds=2,
+                                period_seconds=2,
+                                timeout_seconds=1,
+                                failure_threshold=30,
+                            ),
                             env=code_server_env,
                             resources=get_workspace_resources(resource_profile),
                             volume_mounts=volume_mounts,  # 동적으로 만든 volume_mounts 리스트 적용
@@ -1210,6 +1220,15 @@ def resolve_namespace(ns: str) -> str:
         return resolved
     validate_namespace(ns)
     return ns
+
+
+K8S_RESOURCE_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
+
+
+def validate_resource_name(name: str) -> str:
+    if len(name) > 63 or not K8S_RESOURCE_NAME_PATTERN.fullmatch(name):
+        raise HTTPException(status_code=400, detail="Kubernetes 리소스 이름 형식이 올바르지 않습니다.")
+    return name
 
 def ensure_course_metadata(core_v1_api, namespace: str, course_id: int):
     name = "jcode-course-metadata"
@@ -1928,6 +1947,65 @@ async def deploy_resources(
     except Exception as e:
         logger.exception("리소스 배포 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/jcode/status")
+async def get_jcode_status(
+    course_id: int,
+    namespace: str,
+    deployment_name: str,
+    service_name: str,
+    token_payload: dict = Depends(require_service_scope("jcode:read", "workspace")),
+):
+    """Report readiness only after both the Deployment and Service endpoint are ready."""
+    namespace = resolve_namespace(namespace)
+    deployment_name = validate_resource_name(deployment_name)
+    service_name = validate_resource_name(service_name)
+    core_v1_api = client.CoreV1Api()
+    apps_v1_api = client.AppsV1Api()
+    verify_course_namespace(core_v1_api, namespace, course_id)
+
+    try:
+        deployment = apps_v1_api.read_namespaced_deployment(deployment_name, namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"state": "PENDING", "reasonCode": "DEPLOYMENT_PENDING"}
+        raise
+
+    conditions = deployment.status.conditions or []
+    if any(
+        condition.type == "Progressing"
+        and condition.status == "False"
+        and condition.reason == "ProgressDeadlineExceeded"
+        for condition in conditions
+    ):
+        return {"state": "FAILED", "reasonCode": "DEPLOYMENT_PROGRESS_DEADLINE"}
+
+    desired = deployment.spec.replicas or 1
+    deployment_ready = (
+        (deployment.status.observed_generation or 0) >= (deployment.metadata.generation or 0)
+        and (deployment.status.updated_replicas or 0) >= desired
+        and (deployment.status.available_replicas or 0) >= desired
+        and (deployment.status.ready_replicas or 0) >= desired
+    )
+    if not deployment_ready:
+        return {"state": "PENDING", "reasonCode": "DEPLOYMENT_NOT_READY"}
+
+    try:
+        endpoints = core_v1_api.read_namespaced_endpoints(service_name, namespace)
+    except ApiException as error:
+        if error.status == 404:
+            return {"state": "PENDING", "reasonCode": "SERVICE_ENDPOINT_PENDING"}
+        raise
+    endpoint_ready = any(subset.addresses for subset in (endpoints.subsets or []))
+    if not endpoint_ready:
+        return {"state": "PENDING", "reasonCode": "SERVICE_ENDPOINT_NOT_READY"}
+
+    return {
+        "state": "READY",
+        "reasonCode": "READY",
+        "jcodeUrl": f"http://{service_name}.{namespace}.svc.cluster.local:8080",
+    }
     
 @app.delete("/api/jcode")
 async def delete_resources(
