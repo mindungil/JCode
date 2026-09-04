@@ -202,7 +202,8 @@ JCODE_NAMESPACE=watcher GENERATOR_CONFIGMAP_NAME=jcode-generator-configmap \
 jq -e '
   .data.NFS_SERVER == "10.233.9.148" and
   .data.NFS_PATH == "/pvc-11111111-2222-3333-4444-555555555555" and
-  .data.NFS_MOUNT_PATH == "/nfs-data"
+  .data.NFS_MOUNT_PATH == "/nfs-data" and
+  .data.WORKSPACE_EXTENSIONS_DIR == "extensions-v2"
 ' "$storage_patch" >/dev/null
 grep -q 'get service pvc-11111111-2222-3333-4444-555555555555' "$MOCK_LOG"
 

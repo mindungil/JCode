@@ -475,6 +475,17 @@ def get_nfs_workspace_path() -> Path:
     return mount_path / "workspace"
 
 
+def get_workspace_extensions_root() -> Path:
+    directory = os.getenv("WORKSPACE_EXTENSIONS_DIR", "extensions-v2").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", directory):
+        raise RuntimeError("WORKSPACE_EXTENSIONS_DIR는 안전한 단일 디렉터리 이름이어야 합니다.")
+    return Path(NFS_MOUNT_PATH) / directory
+
+
+def get_workspace_extension_subpath(student_num: str) -> str:
+    return str(get_workspace_extensions_root().relative_to(Path(NFS_MOUNT_PATH)) / student_num)
+
+
 def get_starter_artifact_root() -> Path:
     root = Path(os.getenv("STARTER_ARTIFACT_ROOT", "/starter-data").strip())
     if not root.is_absolute():
@@ -619,7 +630,7 @@ def get_smoke_workspace_paths(file_path: str, student_num: str) -> tuple[Path, P
     nfs_root = Path(NFS_MOUNT_PATH).resolve()
     candidates = (
         nfs_root.joinpath(*file_path.split("/")),
-        nfs_root / "extensions" / student_num,
+        get_workspace_extensions_root() / student_num,
     )
     paths = []
     for candidate in candidates:
@@ -654,7 +665,7 @@ def cleanup_smoke_workspace(file_path: str, student_num: str) -> None:
         if path.exists():
             shutil.rmtree(path)
     # workspace/release-smoke는 이 기능 전용이므로 비어 있으면 정리한다.
-    # extensions는 공용 루트이므로 절대 삭제하지 않는다.
+    # 확장 공용 루트는 이 기능의 소유가 아니므로 절대 삭제하지 않는다.
     try:
         paths[0].parent.rmdir()
     except OSError:
@@ -914,19 +925,13 @@ def create_deployment(
     base_image: Optional[str] = None, resource_profile: str = "STANDARD",
     workspace_scope: str = "COURSE", assignment_workspace_key: Optional[str] = None,
 ) -> str:
-    init_volume_mounts=[
-        client.V1VolumeMount(
-            name="jcode-vol",
-            mount_path="/home/coder/extensions",
-            sub_path=f"extensions/{student_num}"
-        )
-    ]
+    init_volume_mounts = []
 
     volume_mounts=[
         client.V1VolumeMount(
             name="jcode-vol",
             mount_path="/home/coder/extensions",
-            sub_path=f"extensions/{student_num}"
+            sub_path=get_workspace_extension_subpath(student_num)
         ),
         client.V1VolumeMount(
             name="config-vol",
@@ -964,9 +969,7 @@ def create_deployment(
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분
     if use_snapshot:
-        base_cmd = "\
-            chown -R 1000:1000 /home/coder/project && \
-            chown -R 1000:1000 /home/coder/extensions"
+        base_cmd = "chown -R 1000:1000 /home/coder/project"
         init_volume_mounts.append(
             client.V1VolumeMount(
                 name="snapshot-volume",
@@ -1007,8 +1010,7 @@ def create_deployment(
         base_cmd = f"\
             chown -R 1000:1000 /home/coder/project && \
             {hw_cmd}{prac_cmd} && \
-            chown -R 1000:1000 /home/coder/project && \
-            chown -R 1000:1000 /home/coder/extensions"
+            chown -R 1000:1000 /home/coder/project"
         volume_mount=client.V1VolumeMount(
             name="jcode-vol",
             mount_path="/home/coder/project",
@@ -2326,7 +2328,7 @@ async def provision_student_workspace(
         raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
-    extensions = Path(NFS_MOUNT_PATH) / "extensions" / request.student_num
+    extensions = get_workspace_extensions_root() / request.student_num
     for path in (workspace, extensions):
         reject_symlink_path(path.parent, path)
         path.mkdir(parents=True, exist_ok=True)

@@ -34,7 +34,7 @@ fi
 patch=$(jq -n \
   --arg server "$nfs_server" \
   --arg path "$nfs_path" \
-  '{data:{NFS_SERVER:$server,NFS_PATH:$path,NFS_MOUNT_PATH:"/nfs-data"}}')
+  '{data:{NFS_SERVER:$server,NFS_PATH:$path,NFS_MOUNT_PATH:"/nfs-data",WORKSPACE_EXTENSIONS_DIR:"extensions-v2"}}')
 kubectl patch configmap "$configmap_name" \
   -n "$namespace" \
   --type=merge \

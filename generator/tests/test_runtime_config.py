@@ -61,10 +61,13 @@ def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, m
     pod_spec = apps.deployment.spec.template.spec
     init_mounts = pod_spec.init_containers[0].volume_mounts
     runtime = pod_spec.containers[0]
-    assert any(mount.mount_path == "/home/coder/extensions" for mount in init_mounts)
+    assert all(mount.mount_path != "/home/coder/extensions" for mount in init_mounts)
     assert any(mount.mount_path == "/home/coder/extensions" for mount in runtime.volume_mounts)
+    extension_mount = next(mount for mount in runtime.volume_mounts if mount.mount_path == "/home/coder/extensions")
+    assert extension_mount.sub_path == "extensions-v2/20260001"
     assert all(mount.mount_path != "/home/coder/.local" for mount in init_mounts + runtime.volume_mounts)
     assert "/home/coder/.local" not in " ".join(pod_spec.init_containers[0].command)
+    assert "/home/coder/extensions" not in " ".join(pod_spec.init_containers[0].command)
     assert runtime.readiness_probe.tcp_socket.port == 8080
     assert apps.deployment.spec.progress_deadline_seconds == 600
 
@@ -190,7 +193,15 @@ def test_smoke_workspace_paths_are_prepared_and_removed(generator, monkeypatch, 
 
     assert not workspace_path.exists()
     assert not extension_path.exists()
-    assert (tmp_path / "extensions").is_dir()
+    assert (tmp_path / "extensions-v2").is_dir()
+
+
+def test_workspace_extensions_directory_is_a_safe_single_segment(generator, monkeypatch, tmp_path):
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setenv("WORKSPACE_EXTENSIONS_DIR", "../extensions")
+
+    with pytest.raises(RuntimeError, match="WORKSPACE_EXTENSIONS_DIR"):
+        generator.get_workspace_extensions_root()
 
 
 @pytest.mark.parametrize(
