@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import zipfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -197,6 +198,44 @@ def test_student_archive_continues_when_namespace_is_already_missing(generator, 
     assert response["archived"] is True
     assert not source.exists()
     assert (destination / "answer.py").read_text(encoding="utf-8") == "pass"
+
+
+def test_student_archive_does_not_touch_a_reused_namespace(generator, monkeypatch, tmp_path):
+    class ReusedNamespace:
+        def read_namespace(self, name):
+            return SimpleNamespace(
+                metadata=SimpleNamespace(
+                    annotations={"jcode.io/course-id": "2"},
+                    labels={"jcode.io/course-id": "2"},
+                )
+            )
+
+        def read_namespaced_config_map(self, name, namespace):
+            raise AssertionError("reused namespace must not use old course permissions")
+
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(generator, "COURSE_NAMESPACE_PREFIX", "jcode-")
+    monkeypatch.setattr(generator, "get_workspace_archive_root", lambda: tmp_path / "archive")
+    monkeypatch.setattr(generator.client, "CoreV1Api", ReusedNamespace)
+    monkeypatch.setattr(
+        generator.client,
+        "AppsV1Api",
+        lambda: (_ for _ in ()).throw(AssertionError("reused namespace must not be modified")),
+    )
+    request = generator.StudentArchiveRequest(
+        course_id=1,
+        namespace="jcode-os-1",
+        student_num="20260001",
+        archive_key="12345678-1234-1234-1234-123456789abc",
+    )
+
+    response = asyncio.run(generator.archive_student_workspace(request, {}))
+
+    assert response == {
+        "archived": True,
+        "archive_key": request.archive_key,
+        "namespace_reused": True,
+    }
 
 
 def test_archive_move_supports_different_filesystems(generator, monkeypatch, tmp_path):

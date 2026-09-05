@@ -2552,9 +2552,15 @@ async def archive_student_workspace(
     if not re.fullmatch(r"[0-9a-f-]{36}", request.archive_key):
         raise HTTPException(status_code=400, detail="archive_key 형식이 올바르지 않습니다.")
 
+    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+    source = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
+    destination = resolve_below(
+        get_workspace_archive_root(),
+        f"memberships/{class_div}/{request.student_num}/{request.archive_key}",
+    )
     core_api = client.CoreV1Api()
     try:
-        core_api.read_namespace(name=namespace)
+        existing_namespace = core_api.read_namespace(name=namespace)
         namespace_exists = True
     except ApiException as error:
         if error.status != 404:
@@ -2562,18 +2568,26 @@ async def archive_student_workspace(
         namespace_exists = False
 
     if namespace_exists:
+        annotations = existing_namespace.metadata.annotations or {}
+        labels = existing_namespace.metadata.labels or {}
+        recorded_course_id = annotations.get("jcode.io/course-id") or labels.get("jcode.io/course-id")
+        if recorded_course_id and recorded_course_id != str(request.course_id):
+            if source.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Namespace가 다른 강의에 재사용되었고 동일한 Workspace 경로가 존재합니다.",
+                )
+            return {
+                "archived": True,
+                "archive_key": request.archive_key,
+                "namespace_reused": True,
+            }
         verify_course_namespace(core_api, namespace, request.course_id)
         apps_api = client.AppsV1Api()
         for name in request.deployments:
             delete_deployment(apps_api, namespace, name)
         for name in request.services:
             delete_service(core_api, namespace, name)
-    class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
-    source = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
-    destination = resolve_below(
-        get_workspace_archive_root(),
-        f"memberships/{class_div}/{request.student_num}/{request.archive_key}",
-    )
     if source.exists() and destination.exists():
         raise HTTPException(status_code=409, detail="학생 Workspace 원본과 보관본이 함께 존재합니다.")
     if source.exists():
