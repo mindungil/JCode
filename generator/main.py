@@ -95,6 +95,15 @@ WORKSPACE_SETTINGS = {
 }
 CODE_SERVER_POLICY = {
     "AllowedExtensions": {"*": False},
+    "ChatAgentMode": False,
+    "ChatAgentExtensionTools": False,
+    "ChatPluginsEnabled": False,
+    "ChatStrictMarketplaces": True,
+    "ChatMCP": "none",
+    "ChatAllowedMcpServers": [],
+    "ChatAllowManagedMcpServersOnly": True,
+    "Claude3PIntegration": False,
+    "Codex3PIntegration": False,
     "ExtensionsAutoUpdate": False,
     "EnableTelemetry": False,
     "UpdateMode": "none",

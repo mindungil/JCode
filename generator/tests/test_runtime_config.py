@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -477,3 +478,9 @@ def test_managed_config_map_is_replaced_with_resource_version(generator):
     assert "config.yaml" in core_v1.replaced.data
     assert '"AllowedExtensions"' in core_v1.replaced.data["policy.json"]
     assert '"*": false' in core_v1.replaced.data["policy.json"]
+    policy = json.loads(core_v1.replaced.data["policy.json"])
+    assert policy["ChatAgentMode"] is False
+    assert policy["ChatMCP"] == "none"
+    assert policy["ChatAllowedMcpServers"] == []
+    assert policy["Claude3PIntegration"] is False
+    assert policy["Codex3PIntegration"] is False
