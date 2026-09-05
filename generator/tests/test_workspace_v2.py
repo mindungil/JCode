@@ -133,6 +133,10 @@ def test_general_workspace_shows_user_and_named_assignments(generator, monkeypat
     (student / "assignment-7").mkdir(parents=True)
     (student / "assignment-9").mkdir()
     (student / "assignment-10").mkdir()
+    (student / "hw1").mkdir()
+    (student / "hw2").mkdir()
+    (student / "hw2" / "answer.c").write_text("int main(void) {}", encoding="utf-8")
+    (student / "prac1").mkdir()
     monkeypatch.setattr(os, "chown", lambda *_: None)
 
     generator.write_assignment_workspace_descriptor(student, "assignment-7", "자료구조 첫 과제")
@@ -153,6 +157,8 @@ def test_general_workspace_shows_user_and_named_assignments(generator, monkeypat
     assert (student / "workspace").is_dir()
     assert "과제명 폴더" in (student / "workspace" / "README.md").read_text(encoding="utf-8")
     assert not (student / "hw1").exists()
+    assert not (student / "prac1").exists()
+    assert (student / "hw2" / "answer.c").is_file()
 
     (student / "workspace" / "README.md").write_text("사용자 내용", encoding="utf-8")
     generator.write_general_workspace_descriptor(student, "홍길동")

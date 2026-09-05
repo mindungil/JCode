@@ -633,6 +633,17 @@ def ensure_personal_workspace_readme(personal_workspace: Path) -> None:
     os.chmod(readme, 0o640)
 
 
+def remove_empty_legacy_workspace_dirs(student_dir: Path) -> None:
+    for candidate in student_dir.iterdir():
+        if candidate.is_symlink() or not re.fullmatch(r"(?:hw|prac)[1-9][0-9]*", candidate.name):
+            continue
+        try:
+            candidate.rmdir()
+        except OSError:
+            # A non-empty legacy directory may contain user work and must be preserved.
+            continue
+
+
 def write_workspace_json(student_dir: Path, filename: str, payload: dict) -> None:
     metadata_dir = student_dir / ".jcode"
     descriptor = metadata_dir / filename
@@ -727,6 +738,7 @@ def write_general_workspace_descriptor(student_dir: Path, display_name: Optional
         raise HTTPException(status_code=409, detail="사용자 작업공간 경로를 사용할 수 없습니다.")
     os.chown(personal_workspace, 1000, 1000)
     ensure_personal_workspace_readme(personal_workspace)
+    remove_empty_legacy_workspace_dirs(student_dir)
     payload = {
         "folders": [
             {"name": PERSONAL_WORKSPACE_LABEL, "path": "../workspace"},
