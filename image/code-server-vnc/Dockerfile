@@ -25,6 +25,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
       websockify \
       python3 \
       python3-pip \
+      python3-ipykernel \
       python3-tk \
       gcc \
       gdb \
@@ -59,11 +60,6 @@ RUN mkdir -p /home/coder/.config/pip \
     chown -R 1000:1000 /home/coder /logs
 
 ENV PATH="${PATH}:/home/coder/.local/bin"
-
-RUN pip3 install --upgrade pip --break-system-packages && \
-    pip3 install ipykernel --break-system-packages && \
-    python3 -m ipykernel install --user --name=python3 --display-name "Python 3 (System)" && \
-    chown -R 1000:1000 /home/coder
 
 COPY supervisor/supervisord.default.conf /etc/supervisor/supervisord.conf
 
