@@ -28,6 +28,11 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
       rm -rf /var/lib/apt/lists/*; \
     fi
 
+# JCode does not provide AI coding assistants, including the extension bundled
+# with recent upstream VS Code releases.
+RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot && \
+    test ! -e /usr/lib/code-server/lib/vscode/extensions/copilot
+
 EXPOSE 8080
 
 USER coder

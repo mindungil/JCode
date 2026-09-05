@@ -45,6 +45,10 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
       fonts-nanum && \
     rm -rf /var/lib/apt/lists/*
 
+# Keep the VNC variant under the same no-AI policy as the browser IDE.
+RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot && \
+    test ! -e /usr/lib/code-server/lib/vscode/extensions/copilot
+
 RUN mkdir -p /home/coder/.config/pip \
       /home/coder/.config/tigervnc \
       /home/coder/.ipython/profile_default/startup \
