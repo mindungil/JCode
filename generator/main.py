@@ -337,6 +337,8 @@ def build_code_server_args(use_vnc: bool) -> list[str]:
             configured.extend(["--auth", "none"])
     if not any(arg == "--extensions-dir" or arg.startswith("--extensions-dir=") for arg in configured):
         configured.extend(["--extensions-dir", "/home/coder/extensions"])
+    if "--disable-workspace-trust" not in configured:
+        configured.append("--disable-workspace-trust")
     if any(arg == "--restrict-workspace-root" or arg.startswith("--restrict-workspace-root=") for arg in configured):
         raise RuntimeError("현재 code-server는 --restrict-workspace-root 옵션을 지원하지 않습니다.")
     if get_workspace_root() not in configured:

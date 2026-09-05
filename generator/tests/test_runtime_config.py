@@ -28,6 +28,7 @@ def test_code_server_args_are_shell_split(generator, monkeypatch):
         "none",
         "--extensions-dir",
         "/home/coder/extensions",
+        "--disable-workspace-trust",
     ]
 
 
