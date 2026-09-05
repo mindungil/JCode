@@ -1,11 +1,12 @@
 # === Builder Stage ===
-ARG JCODE_CODE_SERVER_BASE
+ARG JCODE_CODE_SERVER_BASE=ghcr.io/coder/code-server:4.135.0@sha256:ccd326184d71efc5ebb94155eda7bb30153902342a35dbc8525450d81aa55012
 FROM ${JCODE_CODE_SERVER_BASE} AS builder
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 기본 Debian mirror를 사용한다.
+# HTTPS Debian mirror를 사용한다.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources
 
 # 필수 패키지 설치 (최종 스테이지에서는 runit 대신 supervisord를 사용할 예정)
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -47,8 +48,8 @@ RUN mkdir -p /runtime && \
 
 # === Final Stage ===
 FROM ${JCODE_CODE_SERVER_BASE}
-ARG JCODE_CODE_SERVER_BASE_DIGEST
-ARG JCODE_CODE_SERVER_REVISION
+ARG JCODE_CODE_SERVER_BASE_DIGEST=sha256:ccd326184d71efc5ebb94155eda7bb30153902342a35dbc8525450d81aa55012
+ARG JCODE_CODE_SERVER_REVISION=local
 
 LABEL org.opencontainers.image.title="code-server-vnc"
 LABEL org.opencontainers.image.description="VS Code(code-server) + VNC/novnc 환경 이미지"
@@ -57,11 +58,13 @@ LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.source="https://github.com/coder/code-server"
 LABEL org.opencontainers.image.revision="${JCODE_CODE_SERVER_REVISION}"
 LABEL org.opencontainers.image.base.digest="${JCODE_CODE_SERVER_BASE_DIGEST}"
+LABEL org.opencontainers.image.base.version="4.135.0"
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 기본 Debian mirror를 사용한다.
+# HTTPS Debian mirror를 사용한다.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources
 
 # 최종 이미지에서는 빌더에서 설정한 내용만 복사 (필요한 런타임 설정 파일)
 COPY --from=builder /runtime/ /runtime/
@@ -127,10 +130,6 @@ RUN cp -r /runtime/.vnc /home/coder/ && \
 
 # 환경별 비밀값이 없는 재현 가능한 기본 supervisor 설정
 COPY supervisor/supervisord.default.conf /etc/supervisor/supervisord.conf
-
-# UX guard only. The actual boundary is the Pod security context and NFS mount.
-COPY restricted-shell.sh /etc/profile.d/restricted-shell.sh
-RUN chmod 644 /etc/profile.d/restricted-shell.sh
 
 # 포트 개방 (code-server:8080, VNC:5900~5910, websockify(noVNC):6080~6100)
 EXPOSE 8080 5900-5910 6080-6100

@@ -337,8 +337,8 @@ def build_code_server_args(use_vnc: bool) -> list[str]:
             configured.extend(["--auth", "none"])
     if not any(arg == "--extensions-dir" or arg.startswith("--extensions-dir=") for arg in configured):
         configured.extend(["--extensions-dir", "/home/coder/extensions"])
-    if "--restrict-workspace-root" not in configured:
-        configured.extend(["--restrict-workspace-root", get_workspace_root()])
+    if any(arg == "--restrict-workspace-root" or arg.startswith("--restrict-workspace-root=") for arg in configured):
+        raise RuntimeError("현재 code-server는 --restrict-workspace-root 옵션을 지원하지 않습니다.")
     if get_workspace_root() not in configured:
         configured.append(get_workspace_root())
     return configured
@@ -1026,7 +1026,7 @@ def create_deployment(
         client.V1ContainerPort(container_port=8080)  # 기본적으로 code-server 포트만 설정
     ]
 
-    # 커스텀 fork가 들어간 불변 이미지만 허용한다.
+    # 검증된 Harbor의 불변 이미지 레퍼런스만 허용한다.
     image_name = get_requested_workspace_image(use_vnc, environment_profile, base_image)
 
     # SNAPSHOT용 / 개발용 프로젝트 폴더 설정 구분

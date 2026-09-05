@@ -28,9 +28,17 @@ def test_code_server_args_are_shell_split(generator, monkeypatch):
         "none",
         "--extensions-dir",
         "/home/coder/extensions",
-        "--restrict-workspace-root",
-        "/home/coder/project",
     ]
+
+
+def test_removed_fork_workspace_flag_is_rejected(generator, monkeypatch):
+    monkeypatch.setenv(
+        "CODE_SERVER_ARGS",
+        "--restrict-workspace-root /home/coder/project /home/coder/project",
+    )
+
+    with pytest.raises(RuntimeError, match="지원하지 않습니다"):
+        generator.get_code_server_args(False)
 
 
 def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, monkeypatch):
