@@ -20,26 +20,22 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     rm -rf /var/lib/apt/lists/*
 
 # Openbox 세션 실행 설정 (최소한의 GUI 환경)
-RUN echo "exec openbox-session" > ~/.xsession && \
-    echo "exec openbox-session" > ~/.xinitrc
-
-# VNC는 ClusterIP + Router 인증 뒤에서만 제공하며 이미지에 공용 비밀번호를 넣지 않는다.
-RUN mkdir -p /root/.vnc
+RUN mkdir -p /root/.config/tigervnc && \
+    echo "exec openbox-session" > ~/.xsession && \
+    echo "exec openbox-session" > ~/.xinitrc && \
+    echo "exec openbox-session" > /root/.config/tigervnc/xstartup && \
+    chmod +x /root/.config/tigervnc/xstartup
 
 # VNC 서버 실행 테스트 (화면 :1) - 설정 확인용으로 실행 후 종료
 RUN vncserver :1 -geometry 1280x800 -depth 24 -SecurityTypes None && \
     vncserver -kill :1
-
-# VNC 세션에 openbox 실행 (VNC 접속 시 최소한의 창 관리자만 실행)
-RUN echo "exec openbox-session" > ~/.vnc/xstartup && \
-    chmod +x ~/.vnc/xstartup
 
 # noVNC가 정상 동작하도록 패키지.json 파일 복사 (workaround)
 RUN cp /usr/share/novnc/vnc.html /usr/share/novnc/package.json
 
 # 필요한 설정 파일들을 /runtime 디렉토리로 복사 (최종 스테이지에 전달할 파일)
 RUN mkdir -p /runtime && \
-    cp -r /root/.vnc /runtime/ && \
+    cp -r /root/.config/tigervnc /runtime/ && \
     cp -r ~/.xsession /runtime/ && \
     cp -r ~/.xinitrc /runtime/ && \
     cp -r /usr/share/novnc /runtime/novnc && \
@@ -117,7 +113,8 @@ RUN pip3 install --upgrade pip --break-system-packages && \
     python3 -m ipykernel install --user --name=python3 --display-name "Python 3 (System)"
 
 # 설정 파일들을 제 위치로 복사
-RUN cp -r /runtime/.vnc /home/coder/ && \
+RUN mkdir -p /home/coder/.config && \
+    cp -r /runtime/tigervnc /home/coder/.config/ && \
     cp -r /runtime/.xsession /home/coder/ && \
     cp -r /runtime/.xinitrc /home/coder/ && \
     cp -r /runtime/novnc /usr/share/novnc && \
