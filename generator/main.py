@@ -75,6 +75,30 @@ WORKSPACE_PROXY_NAMESPACE = os.getenv("WORKSPACE_PROXY_NAMESPACE", "").strip()
 WORKSPACE_PROXY_POD_LABEL = os.getenv("WORKSPACE_PROXY_POD_LABEL", "").strip()
 WORKSPACE_PROXY_PORT = int(os.getenv("WORKSPACE_PROXY_PORT", "3000"))
 DEFAULT_HARBOR_REGISTRY = "harbor.jedutools.io"
+GENERAL_WORKSPACE_SUFFIX = "의 JCode.code-workspace"
+PERSONAL_WORKSPACE_LABEL = "내 작업공간"
+PERSONAL_WORKSPACE_README = """# 내 작업공간
+
+이 폴더는 과제와 별도로 자유롭게 사용하는 개인 JCode 공간입니다.
+
+- 일반 작업은 이 폴더에 저장하세요.
+- 과제 작업은 탐색기에 표시된 과제명 폴더를 사용하세요.
+- JCode 실행 화면에서는 내 작업공간과 현재 열린 과제를 함께 사용할 수 있습니다.
+"""
+WORKSPACE_SETTINGS = {
+    "chat.disableAIFeatures": True,
+    "chat.commandCenter.enabled": False,
+    "workbench.settings.showAISearchToggle": False,
+    "extensions.autoCheckUpdates": False,
+    "extensions.autoUpdate": False,
+    "telemetry.telemetryLevel": "off",
+}
+CODE_SERVER_POLICY = {
+    "AllowedExtensions": {"*": False},
+    "ExtensionsAutoUpdate": False,
+    "EnableTelemetry": False,
+    "UpdateMode": "none",
+}
 WORKSPACE_NO_PROXY = os.getenv(
     "WORKSPACE_NO_PROXY",
     "localhost,127.0.0.1,.svc,.cluster.local,watcher-backend-service.watcher.svc.cluster.local",
@@ -151,7 +175,7 @@ class DeployRequest(BaseModel):
     egress_policy: str = "PACKAGE_PROXY"
     workspace_scope: str = "COURSE"
     assignment_workspace_key: Optional[str] = None
-    workspace_display_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    workspace_display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     use_snapshot: bool
     hw_count: int = Field(default=0, ge=0, le=100)
     prac_count: int = Field(default=0, ge=0, le=10)
@@ -217,7 +241,7 @@ class StudentProvisionRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
     student_num: str
-    display_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     workspace_keys: list[str] = Field(default=[])
     workspace_labels: dict[str, str] = Field(default={})
     artifacts: list[StudentArtifactRef] = Field(default=[])
@@ -342,6 +366,10 @@ def build_code_server_args(use_vnc: bool) -> list[str]:
         configured.extend(["--extensions-dir", "/home/coder/extensions"])
     if "--disable-workspace-trust" not in configured:
         configured.append("--disable-workspace-trust")
+    if "--disable-telemetry" not in configured:
+        configured.append("--disable-telemetry")
+    if "--disable-update-check" not in configured:
+        configured.append("--disable-update-check")
     if any(arg == "--restrict-workspace-root" or arg.startswith("--restrict-workspace-root=") for arg in configured):
         raise RuntimeError("현재 code-server는 --restrict-workspace-root 옵션을 지원하지 않습니다.")
     if get_workspace_root() not in configured:
@@ -586,6 +614,25 @@ def validate_workspace_display_name(value: str, max_length: int = 100) -> str:
     return label
 
 
+def general_workspace_filename(display_name: str) -> str:
+    label = validate_workspace_display_name(display_name, 50)
+    if re.search(r'[\\/:*?"<>|]', label):
+        raise HTTPException(status_code=400, detail="display_name에 파일명으로 사용할 수 없는 문자가 있습니다.")
+    return f"{label}{GENERAL_WORKSPACE_SUFFIX}"
+
+
+def ensure_personal_workspace_readme(personal_workspace: Path) -> None:
+    readme = personal_workspace / "README.md"
+    reject_symlink_path(personal_workspace, readme)
+    try:
+        with readme.open("x", encoding="utf-8") as output:
+            output.write(PERSONAL_WORKSPACE_README)
+    except FileExistsError:
+        return
+    os.chown(readme, 1000, 1000)
+    os.chmod(readme, 0o640)
+
+
 def write_workspace_json(student_dir: Path, filename: str, payload: dict) -> None:
     metadata_dir = student_dir / ".jcode"
     descriptor = metadata_dir / filename
@@ -657,15 +704,21 @@ def write_general_workspace_descriptor(student_dir: Path, display_name: Optional
     metadata_dir = student_dir / ".jcode"
     profile = metadata_dir / "profile.json"
     if display_name is not None:
-        label = validate_workspace_display_name(display_name)
-        write_workspace_json(student_dir, "profile.json", {"display_name": label})
+        label = validate_workspace_display_name(display_name, 50)
     else:
         try:
             label = validate_workspace_display_name(
-                json.loads(profile.read_text(encoding="utf-8"))["display_name"]
+                json.loads(profile.read_text(encoding="utf-8"))["display_name"], 50
             )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, HTTPException):
             label = student_dir.name.rsplit("-", 1)[-1]
+
+    descriptor_name = general_workspace_filename(label)
+    write_workspace_json(
+        student_dir,
+        "profile.json",
+        {"display_name": label, "general_workspace_file": descriptor_name},
+    )
 
     personal_workspace = student_dir / "workspace"
     reject_symlink_path(student_dir, personal_workspace)
@@ -673,16 +726,20 @@ def write_general_workspace_descriptor(student_dir: Path, display_name: Optional
     if not personal_workspace.is_dir():
         raise HTTPException(status_code=409, detail="사용자 작업공간 경로를 사용할 수 없습니다.")
     os.chown(personal_workspace, 1000, 1000)
-    write_workspace_json(
-        student_dir,
-        "jcode.code-workspace",
-        {
-            "folders": [
-                {"name": label, "path": "../workspace"},
-                *read_assignment_workspace_entries(student_dir),
-            ]
-        },
-    )
+    ensure_personal_workspace_readme(personal_workspace)
+    payload = {
+        "folders": [
+            {"name": PERSONAL_WORKSPACE_LABEL, "path": "../workspace"},
+            *read_assignment_workspace_entries(student_dir),
+        ],
+        "settings": WORKSPACE_SETTINGS,
+    }
+    write_workspace_json(student_dir, descriptor_name, payload)
+    # Keep the old path during rolling upgrades; new Backend instances open the named file.
+    write_workspace_json(student_dir, "jcode.code-workspace", payload)
+    for stale in metadata_dir.glob(f"*{GENERAL_WORKSPACE_SUFFIX}"):
+        if stale.name != descriptor_name and not stale.is_symlink():
+            stale.unlink(missing_ok=True)
 
 
 def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str, display_name: Optional[str]) -> None:
@@ -693,7 +750,10 @@ def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str,
     write_workspace_json(
         student_dir,
         f"{workspace_key}.code-workspace",
-        {"folders": [{"name": label, "path": f"../{workspace_key}"}]},
+        {
+            "folders": [{"name": label, "path": f"../{workspace_key}"}],
+            "settings": WORKSPACE_SETTINGS,
+        },
     )
     write_general_workspace_descriptor(student_dir)
 
@@ -1081,12 +1141,19 @@ def create_deployment(
         client.V1VolumeMount(
             name="jcode-vol",
             mount_path="/home/coder/extensions",
-            sub_path=get_workspace_extension_subpath(student_num)
+            sub_path=get_workspace_extension_subpath(student_num),
+            read_only=True,
         ),
         client.V1VolumeMount(
             name="config-vol",
             mount_path="/home/coder/.config/code-server/config.yaml",
             sub_path="config.yaml"
+        ),
+        client.V1VolumeMount(
+            name="config-vol",
+            mount_path="/etc/vscode/policy.json",
+            sub_path="policy.json",
+            read_only=True,
         )
     ]
 
@@ -1198,6 +1265,7 @@ def create_deployment(
         client.V1EnvVar(name="AUTH", value="none"),
         client.V1EnvVar(name="DISPLAY", value=":1"),  # VNC Display 설정
         client.V1EnvVar(name="JUPYTER_ENABLED", value=str(use_jupyter).lower()),
+        client.V1EnvVar(name="EXTENSIONS_GALLERY", value="{}"),
     ] + get_code_server_extra_env(use_vnc) + get_workspace_proxy_env()
 
     deployment = client.V1Deployment(
@@ -1266,10 +1334,16 @@ def create_deployment(
         logger.info(f"Deployment '{deployment_name}' 생성 완료")
         return f"Deployment '{deployment_name}' 생성 완료"
     except ApiException as e:
-        logger.exception("Deployment 생성 중 오류:")
         if e.status == 409:
-            return f"Deployment '{deployment_name}'가 이미 존재합니다."
+            apps_v1_api.patch_namespaced_deployment(
+                name=deployment_name,
+                namespace=namespace,
+                body=deployment,
+            )
+            logger.info(f"Deployment '{deployment_name}' 갱신 완료")
+            return f"Deployment '{deployment_name}' 갱신 완료"
         else:
+            logger.exception("Deployment 생성 중 오류:")
             raise Exception(f"Deployment 생성 중 오류: {e}")
 
 def create_service(core_v1_api, namespace: str, service_name: str, app_label: str, use_vnc: bool) -> str:
@@ -1507,7 +1581,10 @@ def ensure_code_server_config(core_v1_api, namespace: str):
         core_v1_api,
         namespace,
         "code-server-config",
-        {"config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n"},
+        {
+            "config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n",
+            "policy.json": json.dumps(CODE_SERVER_POLICY, ensure_ascii=False, indent=2) + "\n",
+        },
     )
 
 

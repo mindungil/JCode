@@ -118,7 +118,8 @@ def test_assignment_path_migration_is_idempotent(generator, monkeypatch, tmp_pat
     assert second == {"workspace_key": "assignment-7", "migrated": 0, "created": 0}
     assert (student / "assignment-7" / "answer.py").is_file()
     descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text())
-    assert descriptor == {"folders": [{"name": "자료구조 첫 과제", "path": "../assignment-7"}]}
+    assert descriptor["folders"] == [{"name": "자료구조 첫 과제", "path": "../assignment-7"}]
+    assert descriptor["settings"]["chat.disableAIFeatures"] is True
 
     renamed = request.model_copy(update={"display_name": "자료구조 수정 과제"})
     third = asyncio.run(generator.provision_assignment_workspace(renamed, {}))
@@ -139,28 +140,39 @@ def test_general_workspace_shows_user_and_named_assignments(generator, monkeypat
     generator.write_assignment_workspace_descriptor(student, "assignment-10", "마지막 과제")
     generator.write_general_workspace_descriptor(student, "홍길동")
 
-    descriptor = json.loads((student / ".jcode" / "jcode.code-workspace").read_text())
-    assert descriptor == {
-        "folders": [
-            {"name": "홍길동", "path": "../workspace"},
-            {"name": "자료구조 첫 과제", "path": "../assignment-7"},
-            {"name": "알고리즘 실습", "path": "../assignment-9"},
-            {"name": "마지막 과제", "path": "../assignment-10"},
-        ]
-    }
+    descriptor = json.loads((student / ".jcode" / "홍길동의 JCode.code-workspace").read_text())
+    assert descriptor["folders"] == [
+        {"name": "내 작업공간", "path": "../workspace"},
+        {"name": "자료구조 첫 과제", "path": "../assignment-7"},
+        {"name": "알고리즘 실습", "path": "../assignment-9"},
+        {"name": "마지막 과제", "path": "../assignment-10"},
+    ]
+    assert descriptor["settings"]["chat.disableAIFeatures"] is True
+    assert descriptor["settings"]["chat.commandCenter.enabled"] is False
+    assert json.loads((student / ".jcode" / "jcode.code-workspace").read_text()) == descriptor
     assert (student / "workspace").is_dir()
+    assert "과제명 폴더" in (student / "workspace" / "README.md").read_text(encoding="utf-8")
     assert not (student / "hw1").exists()
+
+    (student / "workspace" / "README.md").write_text("사용자 내용", encoding="utf-8")
+    generator.write_general_workspace_descriptor(student, "홍길동")
+    assert (student / "workspace" / "README.md").read_text(encoding="utf-8") == "사용자 내용"
 
     generator.remove_assignment_workspace_descriptor(student, "assignment-7")
     generator.remove_stale_assignment_workspace_descriptors(student, ["assignment-10"])
     generator.write_general_workspace_descriptor(student)
-    descriptor = json.loads((student / ".jcode" / "jcode.code-workspace").read_text())
+    descriptor = json.loads((student / ".jcode" / "홍길동의 JCode.code-workspace").read_text())
     assert descriptor["folders"] == [
-        {"name": "홍길동", "path": "../workspace"},
+        {"name": "내 작업공간", "path": "../workspace"},
         {"name": "마지막 과제", "path": "../assignment-10"},
     ]
     assert (student / "assignment-9").is_dir()
     assert not (student / ".jcode" / "assignment-9.code-workspace").exists()
+
+
+def test_general_workspace_filename_rejects_path_characters(generator):
+    with pytest.raises(generator.HTTPException, match="파일명"):
+        generator.general_workspace_filename("다른/사용자")
 
 
 def test_student_archive_continues_when_namespace_is_already_missing(generator, monkeypatch, tmp_path):

@@ -29,6 +29,8 @@ def test_code_server_args_are_shell_split(generator, monkeypatch):
         "--extensions-dir",
         "/home/coder/extensions",
         "--disable-workspace-trust",
+        "--disable-telemetry",
+        "--disable-update-check",
     ]
 
 
@@ -74,6 +76,11 @@ def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, m
     assert any(mount.mount_path == "/home/coder/extensions" for mount in runtime.volume_mounts)
     extension_mount = next(mount for mount in runtime.volume_mounts if mount.mount_path == "/home/coder/extensions")
     assert extension_mount.sub_path == "extensions-v2/20260001"
+    assert extension_mount.read_only is True
+    policy_mount = next(mount for mount in runtime.volume_mounts if mount.mount_path == "/etc/vscode/policy.json")
+    assert policy_mount.sub_path == "policy.json"
+    assert policy_mount.read_only is True
+    assert next(item.value for item in runtime.env if item.name == "EXTENSIONS_GALLERY") == "{}"
     assert all(mount.mount_path != "/home/coder/.local" for mount in init_mounts + runtime.volume_mounts)
     assert "/home/coder/.local" not in " ".join(pod_spec.init_containers[0].command)
     assert "/home/coder/extensions" not in " ".join(pod_spec.init_containers[0].command)
@@ -83,6 +90,43 @@ def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, m
     assert "/home/coder/project/prac" not in init_command
     assert runtime.readiness_probe.tcp_socket.port == 8080
     assert apps.deployment.spec.progress_deadline_seconds == 600
+
+
+def test_existing_workspace_deployment_is_reconciled(generator, monkeypatch):
+    class AppsV1:
+        def __init__(self):
+            self.patched = None
+
+        def create_namespaced_deployment(self, namespace, body):
+            raise generator.ApiException(status=409)
+
+        def patch_namespaced_deployment(self, name, namespace, body):
+            self.patched = body
+
+    monkeypatch.setattr(generator, "get_requested_workspace_image", lambda *_: "harbor/image@sha256:" + "a" * 64)
+    monkeypatch.setattr(generator, "get_workspace_init_image", lambda: "harbor/init@sha256:" + "b" * 64)
+    monkeypatch.setattr(generator, "get_workspace_resources", lambda *_: generator.client.V1ResourceRequirements())
+    monkeypatch.setattr(generator, "get_image_pull_secret_names", lambda: [])
+    apps = AppsV1()
+
+    result = generator.create_deployment(
+        apps,
+        "jcode-alg-1",
+        "jcode-alg-1-20260001",
+        "jcode-alg-1-20260001",
+        "workspace/alg-1-20260001",
+        "20260001",
+        False,
+        False,
+    )
+
+    assert result == "Deployment 'jcode-alg-1-20260001' 갱신 완료"
+    runtime = apps.patched.spec.template.spec.containers[0]
+    assert next(item.value for item in runtime.env if item.name == "EXTENSIONS_GALLERY") == "{}"
+    assert next(
+        mount.read_only for mount in runtime.volume_mounts
+        if mount.mount_path == "/etc/vscode/policy.json"
+    ) is True
 
 
 def test_jcode_status_requires_deployment_and_service_endpoint(generator, monkeypatch):
@@ -431,3 +475,5 @@ def test_managed_config_map_is_replaced_with_resource_version(generator):
 
     assert core_v1.replaced.metadata.resource_version == "17"
     assert "config.yaml" in core_v1.replaced.data
+    assert '"AllowedExtensions"' in core_v1.replaced.data["policy.json"]
+    assert '"*": false' in core_v1.replaced.data["policy.json"]
