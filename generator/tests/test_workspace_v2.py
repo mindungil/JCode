@@ -162,6 +162,43 @@ def test_general_workspace_shows_user_and_named_assignments(generator, monkeypat
     assert not (student / ".jcode" / "assignment-9.code-workspace").exists()
 
 
+def test_student_archive_continues_when_namespace_is_already_missing(generator, monkeypatch, tmp_path):
+    class MissingNamespace:
+        def read_namespace(self, name):
+            raise generator.ApiException(status=404)
+
+        def read_namespaced_config_map(self, name, namespace):
+            raise AssertionError("missing namespace must not require a namespaced permission check")
+
+    workspace_root = tmp_path / "workspace"
+    source = workspace_root / "os-1-20260001"
+    source.mkdir(parents=True)
+    (source / "answer.py").write_text("pass", encoding="utf-8")
+    archive_root = tmp_path / "archive"
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(generator, "COURSE_NAMESPACE_PREFIX", "jcode-")
+    monkeypatch.setattr(generator, "get_workspace_archive_root", lambda: archive_root)
+    monkeypatch.setattr(generator.client, "CoreV1Api", MissingNamespace)
+    monkeypatch.setattr(
+        generator.client,
+        "AppsV1Api",
+        lambda: (_ for _ in ()).throw(AssertionError("Kubernetes cleanup must be skipped")),
+    )
+    request = generator.StudentArchiveRequest(
+        course_id=1,
+        namespace="jcode-os-1",
+        student_num="20260001",
+        archive_key="12345678-1234-1234-1234-123456789abc",
+    )
+
+    response = asyncio.run(generator.archive_student_workspace(request, {}))
+
+    destination = archive_root / "memberships" / "os-1" / "20260001" / request.archive_key
+    assert response["archived"] is True
+    assert not source.exists()
+    assert (destination / "answer.py").read_text(encoding="utf-8") == "pass"
+
+
 def test_archive_move_supports_different_filesystems(generator, monkeypatch, tmp_path):
     source = tmp_path / "workspace" / "assignment-1"
     destination = tmp_path / "archive" / "assignment-1"

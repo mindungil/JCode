@@ -2547,17 +2547,27 @@ async def archive_student_workspace(
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
 ):
     namespace = resolve_namespace(request.namespace)
-    verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
     if not re.fullmatch(r"[0-9]{1,20}", request.student_num):
         raise HTTPException(status_code=400, detail="student_num 형식이 올바르지 않습니다.")
     if not re.fullmatch(r"[0-9a-f-]{36}", request.archive_key):
         raise HTTPException(status_code=400, detail="archive_key 형식이 올바르지 않습니다.")
-    apps_api = client.AppsV1Api()
+
     core_api = client.CoreV1Api()
-    for name in request.deployments:
-        delete_deployment(apps_api, namespace, name)
-    for name in request.services:
-        delete_service(core_api, namespace, name)
+    try:
+        core_api.read_namespace(name=namespace)
+        namespace_exists = True
+    except ApiException as error:
+        if error.status != 404:
+            raise
+        namespace_exists = False
+
+    if namespace_exists:
+        verify_course_namespace(core_api, namespace, request.course_id)
+        apps_api = client.AppsV1Api()
+        for name in request.deployments:
+            delete_deployment(apps_api, namespace, name)
+        for name in request.services:
+            delete_service(core_api, namespace, name)
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     source = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
     destination = resolve_below(
