@@ -120,12 +120,22 @@ def test_assignment_path_migration_is_idempotent(generator, monkeypatch, tmp_pat
     descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text())
     assert descriptor["folders"] == [{"name": "자료구조 첫 과제", "path": "../assignment-7"}]
     assert descriptor["settings"]["chat.disableAIFeatures"] is True
+    named = json.loads(
+        (student / ".jcode" / "assignments" / "assignment-7" / "자료구조 첫 과제.code-workspace").read_text()
+    )
+    assert named["folders"] == [{"name": "자료구조 첫 과제", "path": "../../../assignment-7"}]
 
     renamed = request.model_copy(update={"display_name": "자료구조 수정 과제"})
     third = asyncio.run(generator.provision_assignment_workspace(renamed, {}))
     descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text())
     assert third == {"workspace_key": "assignment-7", "migrated": 0, "created": 0}
     assert descriptor["folders"][0]["name"] == "자료구조 수정 과제"
+    assert not (
+        student / ".jcode" / "assignments" / "assignment-7" / "자료구조 첫 과제.code-workspace"
+    ).exists()
+    assert (
+        student / ".jcode" / "assignments" / "assignment-7" / "자료구조 수정 과제.code-workspace"
+    ).is_file()
 
 
 def test_general_workspace_shows_user_and_named_assignments(generator, monkeypatch, tmp_path):
@@ -174,6 +184,7 @@ def test_general_workspace_shows_user_and_named_assignments(generator, monkeypat
     ]
     assert (student / "assignment-9").is_dir()
     assert not (student / ".jcode" / "assignment-9.code-workspace").exists()
+    assert not (student / ".jcode" / "assignments" / "assignment-9").exists()
 
 
 def test_general_workspace_filename_rejects_path_characters(generator):

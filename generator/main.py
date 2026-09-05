@@ -630,6 +630,12 @@ def general_workspace_filename(display_name: str) -> str:
     return f"{label}{GENERAL_WORKSPACE_SUFFIX}"
 
 
+def assignment_workspace_filename(display_name: str) -> str:
+    label = validate_workspace_display_name(display_name, 50)
+    safe_label = re.sub(r'[\\/:*?"<>|]', "_", label).strip().strip(".")[:50]
+    return f"{safe_label or '과제'}.code-workspace"
+
+
 def ensure_personal_workspace_readme(personal_workspace: Path) -> None:
     readme = personal_workspace / "README.md"
     reject_symlink_path(personal_workspace, readme)
@@ -656,17 +662,19 @@ def remove_empty_legacy_workspace_dirs(student_dir: Path) -> None:
 def write_workspace_json(student_dir: Path, filename: str, payload: dict) -> None:
     metadata_dir = student_dir / ".jcode"
     descriptor = metadata_dir / filename
+    descriptor_dir = descriptor.parent
     reject_symlink_path(student_dir, metadata_dir)
+    reject_symlink_path(student_dir, descriptor_dir)
     reject_symlink_path(student_dir, descriptor)
-    metadata_dir.mkdir(parents=True, exist_ok=True)
-    if not metadata_dir.is_dir():
+    descriptor_dir.mkdir(parents=True, exist_ok=True)
+    if not descriptor_dir.is_dir():
         raise HTTPException(status_code=409, detail="Workspace 메타데이터 경로를 사용할 수 없습니다.")
-    os.chown(metadata_dir, 1000, 1000)
+    os.chown(descriptor_dir, 1000, 1000)
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
-        dir=metadata_dir,
-        prefix=f".{filename}.",
+        dir=descriptor_dir,
+        prefix=f".{descriptor.name}.",
         suffix=".tmp",
         delete=False,
     ) as temporary:
@@ -717,6 +725,7 @@ def remove_stale_assignment_workspace_descriptors(student_dir: Path, workspace_k
         if re.fullmatch(r"assignment-[1-9][0-9]*", workspace_key) and workspace_key not in active_keys:
             reject_symlink_path(student_dir, descriptor)
             descriptor.unlink(missing_ok=True)
+            remove_named_assignment_workspace_descriptor(student_dir, workspace_key)
 
 
 def write_general_workspace_descriptor(student_dir: Path, display_name: Optional[str] = None) -> None:
@@ -768,15 +777,35 @@ def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str,
     if display_name is None:
         return
     label = validate_workspace_display_name(display_name, 50)
-    write_workspace_json(
-        student_dir,
-        f"{workspace_key}.code-workspace",
-        {
-            "folders": [{"name": label, "path": f"../{workspace_key}"}],
-            "settings": WORKSPACE_SETTINGS,
-        },
-    )
+    settings = {"settings": WORKSPACE_SETTINGS}
+    write_workspace_json(student_dir, f"{workspace_key}.code-workspace", {
+        "folders": [{"name": label, "path": f"../{workspace_key}"}],
+        **settings,
+    })
+    named_dir = student_dir / ".jcode" / "assignments" / workspace_key
+    named_filename = assignment_workspace_filename(label)
+    write_workspace_json(student_dir, f"assignments/{workspace_key}/{named_filename}", {
+        "folders": [{"name": label, "path": f"../../../{workspace_key}"}],
+        **settings,
+    })
+    for stale in named_dir.glob("*.code-workspace"):
+        if stale.name != named_filename and not stale.is_symlink():
+            stale.unlink(missing_ok=True)
     write_general_workspace_descriptor(student_dir)
+
+
+def remove_named_assignment_workspace_descriptor(student_dir: Path, workspace_key: str) -> None:
+    named_dir = student_dir / ".jcode" / "assignments" / workspace_key
+    reject_symlink_path(student_dir, named_dir)
+    if named_dir.is_dir():
+        for descriptor in named_dir.glob("*.code-workspace"):
+            reject_symlink_path(student_dir, descriptor)
+            descriptor.unlink(missing_ok=True)
+        try:
+            named_dir.rmdir()
+            named_dir.parent.rmdir()
+        except OSError:
+            pass
 
 
 def remove_assignment_workspace_descriptor(student_dir: Path, workspace_key: str) -> None:
@@ -784,6 +813,7 @@ def remove_assignment_workspace_descriptor(student_dir: Path, workspace_key: str
     descriptor = metadata_dir / f"{workspace_key}.code-workspace"
     reject_symlink_path(student_dir, descriptor)
     descriptor.unlink(missing_ok=True)
+    remove_named_assignment_workspace_descriptor(student_dir, workspace_key)
     write_general_workspace_descriptor(student_dir)
 
 
