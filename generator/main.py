@@ -151,10 +151,12 @@ class DeployRequest(BaseModel):
     egress_policy: str = "PACKAGE_PROXY"
     workspace_scope: str = "COURSE"
     assignment_workspace_key: Optional[str] = None
+    workspace_display_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     use_snapshot: bool
-    hw_count: int = Field(default=10, ge=0, le=100)
+    hw_count: int = Field(default=0, ge=0, le=100)
     prac_count: int = Field(default=0, ge=0, le=10)
     assignment_dirs: list[str] = Field(default=[])
+    assignment_labels: dict[str, str] = Field(default={})
 
 class DeleteRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -215,6 +217,7 @@ class StudentProvisionRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
     student_num: str
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     workspace_keys: list[str] = Field(default=[])
     workspace_labels: dict[str, str] = Field(default={})
     artifacts: list[StudentArtifactRef] = Field(default=[])
@@ -576,29 +579,27 @@ def reject_symlink_path(root: Path, candidate: Path) -> None:
         raise HTTPException(status_code=400, detail="관리 경로가 허용 범위를 벗어납니다.") from error
 
 
-def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str, display_name: Optional[str]) -> None:
-    """Keep the stable directory key while showing the configured assignment name in code-server."""
-    if display_name is None:
-        return
-    label = display_name.strip()
-    if not label or len(label) > 50 or any(ord(character) < 32 for character in label):
+def validate_workspace_display_name(value: str, max_length: int = 100) -> str:
+    label = value.strip()
+    if not label or len(label) > max_length or any(ord(character) < 32 for character in label):
         raise HTTPException(status_code=400, detail="display_name 형식이 올바르지 않습니다.")
+    return label
+
+
+def write_workspace_json(student_dir: Path, filename: str, payload: dict) -> None:
     metadata_dir = student_dir / ".jcode"
-    descriptor = metadata_dir / f"{workspace_key}.code-workspace"
+    descriptor = metadata_dir / filename
     reject_symlink_path(student_dir, metadata_dir)
     reject_symlink_path(student_dir, descriptor)
     metadata_dir.mkdir(parents=True, exist_ok=True)
     if not metadata_dir.is_dir():
         raise HTTPException(status_code=409, detail="Workspace 메타데이터 경로를 사용할 수 없습니다.")
     os.chown(metadata_dir, 1000, 1000)
-    payload = {
-        "folders": [{"name": label, "path": f"../{workspace_key}"}],
-    }
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
         dir=metadata_dir,
-        prefix=f".{workspace_key}.",
+        prefix=f".{filename}.",
         suffix=".tmp",
         delete=False,
     ) as temporary:
@@ -613,11 +614,96 @@ def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str,
         temporary_path.unlink(missing_ok=True)
 
 
+def read_assignment_workspace_entries(student_dir: Path) -> list[dict[str, str]]:
+    metadata_dir = student_dir / ".jcode"
+    if not metadata_dir.is_dir() or metadata_dir.is_symlink():
+        return []
+    entries = []
+    descriptors = sorted(
+        metadata_dir.glob("assignment-*.code-workspace"),
+        key=lambda path: int(path.name.removeprefix("assignment-").removesuffix(".code-workspace"))
+        if re.fullmatch(r"assignment-[1-9][0-9]*\.code-workspace", path.name)
+        else 0,
+    )
+    for descriptor in descriptors:
+        workspace_key = descriptor.name.removesuffix(".code-workspace")
+        if not re.fullmatch(r"assignment-[1-9][0-9]*", workspace_key):
+            continue
+        if not (student_dir / workspace_key).is_dir() or descriptor.is_symlink():
+            continue
+        try:
+            folders = json.loads(descriptor.read_text(encoding="utf-8")).get("folders", [])
+            label = validate_workspace_display_name(folders[0]["name"], 50)
+        except (OSError, json.JSONDecodeError, IndexError, KeyError, TypeError, HTTPException):
+            continue
+        entries.append({"name": label, "path": f"../{workspace_key}"})
+    return entries
+
+
+def remove_stale_assignment_workspace_descriptors(student_dir: Path, workspace_keys: list[str]) -> None:
+    metadata_dir = student_dir / ".jcode"
+    if not metadata_dir.is_dir() or metadata_dir.is_symlink():
+        return
+    active_keys = set(workspace_keys)
+    for descriptor in metadata_dir.glob("assignment-*.code-workspace"):
+        workspace_key = descriptor.name.removesuffix(".code-workspace")
+        if re.fullmatch(r"assignment-[1-9][0-9]*", workspace_key) and workspace_key not in active_keys:
+            reject_symlink_path(student_dir, descriptor)
+            descriptor.unlink(missing_ok=True)
+
+
+def write_general_workspace_descriptor(student_dir: Path, display_name: Optional[str] = None) -> None:
+    """Expose a personal workspace and named assignments without leaking storage keys."""
+    metadata_dir = student_dir / ".jcode"
+    profile = metadata_dir / "profile.json"
+    if display_name is not None:
+        label = validate_workspace_display_name(display_name)
+        write_workspace_json(student_dir, "profile.json", {"display_name": label})
+    else:
+        try:
+            label = validate_workspace_display_name(
+                json.loads(profile.read_text(encoding="utf-8"))["display_name"]
+            )
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, HTTPException):
+            label = student_dir.name.rsplit("-", 1)[-1]
+
+    personal_workspace = student_dir / "workspace"
+    reject_symlink_path(student_dir, personal_workspace)
+    personal_workspace.mkdir(parents=True, exist_ok=True)
+    if not personal_workspace.is_dir():
+        raise HTTPException(status_code=409, detail="사용자 작업공간 경로를 사용할 수 없습니다.")
+    os.chown(personal_workspace, 1000, 1000)
+    write_workspace_json(
+        student_dir,
+        "jcode.code-workspace",
+        {
+            "folders": [
+                {"name": label, "path": "../workspace"},
+                *read_assignment_workspace_entries(student_dir),
+            ]
+        },
+    )
+
+
+def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str, display_name: Optional[str]) -> None:
+    """Keep the stable directory key while showing the configured assignment name in code-server."""
+    if display_name is None:
+        return
+    label = validate_workspace_display_name(display_name, 50)
+    write_workspace_json(
+        student_dir,
+        f"{workspace_key}.code-workspace",
+        {"folders": [{"name": label, "path": f"../{workspace_key}"}]},
+    )
+    write_general_workspace_descriptor(student_dir)
+
+
 def remove_assignment_workspace_descriptor(student_dir: Path, workspace_key: str) -> None:
     metadata_dir = student_dir / ".jcode"
     descriptor = metadata_dir / f"{workspace_key}.code-workspace"
     reject_symlink_path(student_dir, descriptor)
     descriptor.unlink(missing_ok=True)
+    write_general_workspace_descriptor(student_dir)
 
 
 def copy_tree_preserving_existing(source: Path, target: Path) -> None:
@@ -984,7 +1070,7 @@ load_incluster_config_or_fail()
 def create_deployment(
     apps_v1_api, namespace: str, deployment_name: str, app_label: str,
     file_path: str, student_num: str, use_vnc: bool, use_snapshot: bool,
-    hw_count: int = 10, prac_count: int = 0, assignment_dirs: list = None,
+    hw_count: int = 0, prac_count: int = 0, assignment_dirs: list = None,
     environment_profile: str = "ALGORITHM", use_jupyter: bool = False,
     base_image: Optional[str] = None, resource_profile: str = "STANDARD",
     workspace_scope: str = "COURSE", assignment_workspace_key: Optional[str] = None,
@@ -1063,17 +1149,14 @@ def create_deployment(
             workspace_key = validate_assignment_workspace_key(assignment_workspace_key)
             file_path = f"{file_path.rstrip('/')}/{workspace_key}"
         if workspace_scope == "ASSIGNMENT":
-            hw_cmd = "true"
-        elif assignment_dirs:
-            safe_dirs = [validate_workspace_dir_name(d) for d in assignment_dirs]
-            dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
-            hw_cmd = f"mkdir -p {dirs}"
+            workspace_cmd = "true"
         else:
-            hw_cmd = f"for i in $(seq 1 {hw_count}); do mkdir -p /home/coder/project/hw$i; done"
-        prac_cmd = f" && for i in $(seq 1 {prac_count}); do mkdir -p /home/coder/project/prac$i; done" if prac_count > 0 and not assignment_dirs else ""
+            safe_dirs = ["workspace", *[validate_workspace_dir_name(d) for d in (assignment_dirs or [])]]
+            dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
+            workspace_cmd = f"mkdir -p {dirs}"
         base_cmd = f"\
             chown -R 1000:1000 /home/coder/project && \
-            {hw_cmd}{prac_cmd} && \
+            {workspace_cmd} && \
             chown -R 1000:1000 /home/coder/project"
         volume_mount=client.V1VolumeMount(
             name="jcode-vol",
@@ -1970,6 +2053,28 @@ async def deploy_resources(
         )
         verify_course_namespace(core_v1_api, namespace, request.course_id)
         prepare_workspace_extension(request.student_num)
+        if not request.use_snapshot and request.workspace_scope == "COURSE":
+            workspace_keys = [validate_assignment_workspace_key(value) for value in request.assignment_dirs]
+            unknown_labels = set(request.assignment_labels) - set(workspace_keys)
+            if unknown_labels:
+                raise HTTPException(status_code=400, detail="assignment_labels에 알 수 없는 workspace_key가 있습니다.")
+            class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+            workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
+            reject_symlink_path(workspace.parent, workspace)
+            workspace.mkdir(parents=True, exist_ok=True)
+            os.chown(workspace, 1000, 1000)
+            for workspace_key in workspace_keys:
+                assignment_path = workspace / workspace_key
+                reject_symlink_path(workspace, assignment_path)
+                assignment_path.mkdir(parents=True, exist_ok=True)
+                os.chown(assignment_path, 1000, 1000)
+                write_assignment_workspace_descriptor(
+                    workspace,
+                    workspace_key,
+                    request.assignment_labels.get(workspace_key),
+                )
+            remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
+            write_general_workspace_descriptor(workspace, request.workspace_display_name)
         ensure_code_server_config(core_v1_api, namespace)
         if request.use_vnc:
             ensure_watcher_hook_config(core_v1_api, namespace)
@@ -2083,7 +2188,6 @@ async def delete_resources(
 
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
-    verify_course_namespace(core_v1_api, namespace, request.course_id)
 
     # 네임스페이스 존재 여부 확인
     try:
@@ -2092,6 +2196,8 @@ async def delete_resources(
         if e.status == 404:
             return {"msg": f"Namespace '{namespace}'와 JCode 리소스는 이미 없습니다."}
         raise
+
+    verify_course_namespace(core_v1_api, namespace, request.course_id)
 
     try:
         # 삭제 시에는 file_path, app_label 등은 사용하지 않고 이름만 사용
@@ -2419,6 +2525,7 @@ async def provision_student_workspace(
         assignment_path.mkdir(parents=True, exist_ok=True)
         os.chown(assignment_path, 1000, 1000)
         write_assignment_workspace_descriptor(workspace, workspace_key, request.workspace_labels.get(workspace_key))
+    remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
     applied = 0
     for artifact_ref in request.artifacts:
         workspace_key = validate_assignment_workspace_key(artifact_ref.workspace_key)
@@ -2430,6 +2537,7 @@ async def provision_student_workspace(
         verify_artifact_checksum(artifact, artifact_ref.checksum)
         apply_starter_artifact(artifact, workspace / workspace_key, artifact_ref.overwrite_policy)
         applied += 1
+    write_general_workspace_descriptor(workspace, request.display_name)
     return {"ready": True, "workspace": workspace.name, "starter_artifacts": applied}
 
 

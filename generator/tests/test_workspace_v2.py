@@ -126,6 +126,42 @@ def test_assignment_path_migration_is_idempotent(generator, monkeypatch, tmp_pat
     assert descriptor["folders"][0]["name"] == "자료구조 수정 과제"
 
 
+def test_general_workspace_shows_user_and_named_assignments(generator, monkeypatch, tmp_path):
+    student = tmp_path / "workspace" / "os-1-20260001"
+    (student / "assignment-7").mkdir(parents=True)
+    (student / "assignment-9").mkdir()
+    (student / "assignment-10").mkdir()
+    monkeypatch.setattr(os, "chown", lambda *_: None)
+
+    generator.write_assignment_workspace_descriptor(student, "assignment-7", "자료구조 첫 과제")
+    generator.write_assignment_workspace_descriptor(student, "assignment-9", "알고리즘 실습")
+    generator.write_assignment_workspace_descriptor(student, "assignment-10", "마지막 과제")
+    generator.write_general_workspace_descriptor(student, "홍길동")
+
+    descriptor = json.loads((student / ".jcode" / "jcode.code-workspace").read_text())
+    assert descriptor == {
+        "folders": [
+            {"name": "홍길동", "path": "../workspace"},
+            {"name": "자료구조 첫 과제", "path": "../assignment-7"},
+            {"name": "알고리즘 실습", "path": "../assignment-9"},
+            {"name": "마지막 과제", "path": "../assignment-10"},
+        ]
+    }
+    assert (student / "workspace").is_dir()
+    assert not (student / "hw1").exists()
+
+    generator.remove_assignment_workspace_descriptor(student, "assignment-7")
+    generator.remove_stale_assignment_workspace_descriptors(student, ["assignment-10"])
+    generator.write_general_workspace_descriptor(student)
+    descriptor = json.loads((student / ".jcode" / "jcode.code-workspace").read_text())
+    assert descriptor["folders"] == [
+        {"name": "홍길동", "path": "../workspace"},
+        {"name": "마지막 과제", "path": "../assignment-10"},
+    ]
+    assert (student / "assignment-9").is_dir()
+    assert not (student / ".jcode" / "assignment-9.code-workspace").exists()
+
+
 def test_archive_move_supports_different_filesystems(generator, monkeypatch, tmp_path):
     source = tmp_path / "workspace" / "assignment-1"
     destination = tmp_path / "archive" / "assignment-1"

@@ -77,6 +77,10 @@ def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, m
     assert all(mount.mount_path != "/home/coder/.local" for mount in init_mounts + runtime.volume_mounts)
     assert "/home/coder/.local" not in " ".join(pod_spec.init_containers[0].command)
     assert "/home/coder/extensions" not in " ".join(pod_spec.init_containers[0].command)
+    init_command = " ".join(pod_spec.init_containers[0].command)
+    assert "/home/coder/project/workspace" in init_command
+    assert "/home/coder/project/hw" not in init_command
+    assert "/home/coder/project/prac" not in init_command
     assert runtime.readiness_probe.tcp_socket.port == 8080
     assert apps.deployment.spec.progress_deadline_seconds == 600
 
