@@ -28,6 +28,70 @@ def test_environment_profiles_reject_inconsistent_presets(generator):
     )
 
 
+def test_course_namespace_annotations_are_human_readable(generator, monkeypatch):
+    monkeypatch.setattr(generator, "JCODE_ENVIRONMENT", "prod")
+
+    annotations = generator.course_namespace_annotations(
+        61, "자료 구조", "홍길동", 2026, 2, 3
+    )
+
+    assert annotations == {
+        "jcode.io/course-id": "61",
+        "jcode.io/environment": "prod",
+        "jcode.io/course-name": "자료 구조",
+        "jcode.io/professor-name": "홍길동",
+        "jcode.io/display-name": "2026-2 | 자료 구조 | 홍길동 | 3분반",
+    }
+
+
+def test_course_namespace_annotations_reject_control_characters(generator):
+    with pytest.raises(generator.HTTPException) as error:
+        generator.course_namespace_annotations(61, "자료\n구조", "홍길동", 2026, 2, 3)
+
+    assert error.value.status_code == 422
+
+
+def test_namespace_metadata_api_updates_existing_course_namespace(generator, monkeypatch):
+    class CoreV1:
+        patch = None
+
+        def read_namespace(self, name):
+            return SimpleNamespace(
+                metadata=SimpleNamespace(
+                    annotations={
+                        "jcode.io/course-id": "61",
+                        "jcode.io/environment": generator.JCODE_ENVIRONMENT,
+                    },
+                    labels={
+                        "jcode.io/course-id": "61",
+                        "jcode.io/environment": generator.JCODE_ENVIRONMENT,
+                    },
+                )
+            )
+
+        def patch_namespace(self, name, body):
+            self.patch = (name, body)
+
+    core = CoreV1()
+    monkeypatch.setattr(generator.client, "CoreV1Api", lambda: core)
+    request = generator.NamespaceMetadataRequest(
+        course_id=61,
+        course_name="자료 구조",
+        professor_name="홍길동",
+        year=2026,
+        term=2,
+        class_section=3,
+    )
+
+    response = asyncio.run(
+        generator.update_namespace_metadata_api("jcode-ab12cd34ef56-3", request, {})
+    )
+
+    assert response["namespace"] == "jcode-ab12cd34ef56-3"
+    annotations = core.patch[1]["metadata"]["annotations"]
+    assert annotations["jcode.io/display-name"] == "2026-2 | 자료 구조 | 홍길동 | 3분반"
+
+
 def test_custom_profile_requires_immutable_harbor_image(generator):
     with pytest.raises(RuntimeError):
         generator.validate_workspace_profile(

@@ -136,6 +136,18 @@ ACTIVE 강좌인 `jcode-realtest2-1`과 `jcode-test2502-1`은 각각 course ID 6
 실제 강의라면 `migrate`와 `course_id`, 예상 대상 Namespace를 명시해야 하며, 분류되지 않은 Namespace가 있으면 전환을 중단합니다.
 production 기능 검증 대상은 release 실행 시 `smoke_course_namespace`로 명시하며 자동 선택하지 않습니다.
 
+## 강의 Namespace 표시 metadata
+
+새 강의 Namespace 이름은 `jcode-<서버 생성 식별자>-<숫자 분반>` 형식입니다. 과목명과 교수명은 이름에 인코딩하지 않고 각각 `jcode.io/course-name`, `jcode.io/professor-name` annotation으로 관리합니다. `jcode.io/display-name`은 연도, 학기, 과목명, 교수명, 분반을 한 줄로 조합한 운영 조회용 값입니다. 기존 Namespace는 이름을 바꾸지 않고 annotation만 보강합니다.
+
+짧은 조회 명령은 kubectl plugin으로 설치합니다.
+
+```bash
+install -m 0755 deploy/tools/kubectl-courses /usr/local/bin/kubectl-courses
+k courses --env prod
+k courses --env dev
+```
+
 ## 렌더링
 
 ```bash

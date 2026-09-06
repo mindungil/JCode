@@ -200,6 +200,11 @@ class DeleteRequest(BaseModel):
 class NamespaceRequest(BaseModel):
     course_id: int = Field(gt=0)
     namespace: str
+    course_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    professor_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
+    year: Optional[int] = Field(default=None, ge=2000, le=2100)
+    term: Optional[int] = Field(default=None, ge=1, le=2)
+    class_section: Optional[int] = Field(default=None, ge=1, le=999)
     use_vnc: bool = False
     environment_profile: str = "ALGORITHM"
     use_jupyter: bool = False
@@ -207,6 +212,14 @@ class NamespaceRequest(BaseModel):
     resource_profile: str = "STANDARD"
     egress_policy: str = "PACKAGE_PROXY"
     workspace_scope: str = "COURSE"
+
+class NamespaceMetadataRequest(BaseModel):
+    course_id: int = Field(gt=0)
+    course_name: str = Field(min_length=1, max_length=100)
+    professor_name: str = Field(min_length=1, max_length=50)
+    year: int = Field(ge=2000, le=2100)
+    term: int = Field(ge=1, le=2)
+    class_section: int = Field(ge=1, le=999)
 
 class ProvisionRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -1566,7 +1579,46 @@ def verify_course_namespace(core_v1_api, namespace: str, course_id: int):
         raise HTTPException(status_code=403, detail="Namespace 환경 정보가 현재 Controller와 일치하지 않습니다.")
 
 
-def ensure_namespace_metadata(core_v1_api, namespace: str, course_id: int):
+def course_namespace_annotations(
+    course_id: int,
+    course_name: Optional[str] = None,
+    professor_name: Optional[str] = None,
+    year: Optional[int] = None,
+    term: Optional[int] = None,
+    class_section: Optional[int] = None,
+) -> dict[str, str]:
+    annotations = {
+        "jcode.io/course-id": str(course_id),
+        "jcode.io/environment": JCODE_ENVIRONMENT,
+    }
+    optional_values = {
+        "jcode.io/course-name": course_name,
+        "jcode.io/professor-name": professor_name,
+    }
+    for key, value in optional_values.items():
+        if value is None:
+            continue
+        normalized = value.strip()
+        if not normalized or re.search(r"[\x00-\x1f\x7f]", normalized):
+            raise HTTPException(status_code=422, detail="강의 metadata에 사용할 수 없는 문자가 포함되어 있습니다.")
+        annotations[key] = normalized
+    if all(value is not None for value in (course_name, professor_name, year, term, class_section)):
+        annotations["jcode.io/display-name"] = (
+            f"{year}-{term} | {course_name.strip()} | {professor_name.strip()} | {class_section}분반"
+        )
+    return annotations
+
+
+def ensure_namespace_metadata(
+    core_v1_api,
+    namespace: str,
+    course_id: int,
+    course_name: Optional[str] = None,
+    professor_name: Optional[str] = None,
+    year: Optional[int] = None,
+    term: Optional[int] = None,
+    class_section: Optional[int] = None,
+):
     """기존 namespace의 강의 소유권을 확인하고 Admission용 metadata를 보완한다."""
     existing = core_v1_api.read_namespace(name=namespace)
     annotations = existing.metadata.annotations or {}
@@ -1591,8 +1643,9 @@ def ensure_namespace_metadata(core_v1_api, namespace: str, course_id: int):
                     "jcode.io/environment": JCODE_ENVIRONMENT,
                 },
                 "annotations": {
-                    "jcode.io/course-id": str(course_id),
-                    "jcode.io/environment": JCODE_ENVIRONMENT,
+                    **course_namespace_annotations(
+                        course_id, course_name, professor_name, year, term, class_section
+                    ),
                 },
             }
         },
@@ -1766,6 +1819,11 @@ def init_namespace(
     core_v1_api, apps_v1_api, rbac_v1_api, networking_v1_api, custom_objects_api,
     namespace: str, course_id: int, use_vnc: bool = False,
     egress_policy: str = "PACKAGE_PROXY",
+    course_name: Optional[str] = None,
+    professor_name: Optional[str] = None,
+    year: Optional[int] = None,
+    term: Optional[int] = None,
+    class_section: Optional[int] = None,
 ):
     """고정된 namespace metadata와 runtime 권한으로 강의 공간을 초기화합니다."""
 
@@ -1779,10 +1837,9 @@ def init_namespace(
                 "jcode.io/course-id": str(course_id),
                 "jcode.io/environment": JCODE_ENVIRONMENT,
             },
-            annotations={
-                "jcode.io/course-id": str(course_id),
-                "jcode.io/environment": JCODE_ENVIRONMENT,
-            },
+            annotations=course_namespace_annotations(
+                course_id, course_name, professor_name, year, term, class_section
+            ),
         )
     )
     try:
@@ -1791,7 +1848,10 @@ def init_namespace(
     except ApiException as e:
         if e.status == 409:
             logger.info(f"Namespace '{namespace}'가 이미 존재합니다.")
-            ensure_namespace_metadata(core_v1_api, namespace, course_id)
+            ensure_namespace_metadata(
+                core_v1_api, namespace, course_id,
+                course_name, professor_name, year, term, class_section,
+            )
         else:
             raise
 
@@ -2044,12 +2104,39 @@ async def create_namespace_api(
             request.course_id,
             request.use_vnc,
             request.egress_policy,
+            request.course_name,
+            request.professor_name,
+            request.year,
+            request.term,
+            request.class_section,
         )
         return {"msg": f"Namespace '{namespace}' 초기화 완료", "namespace": namespace}
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("네임스페이스 초기화 중 오류:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/namespace/{ns}/metadata")
+async def update_namespace_metadata_api(
+    ns: str,
+    request: NamespaceMetadataRequest,
+    token_payload: dict = Depends(require_service_scope("namespace:write", "bootstrap")),
+):
+    """강의 표시 metadata를 기존 Namespace에 동기화한다."""
+    namespace = resolve_namespace(ns)
+    try:
+        ensure_namespace_metadata(
+            client.CoreV1Api(), namespace, request.course_id,
+            request.course_name, request.professor_name,
+            request.year, request.term, request.class_section,
+        )
+        return {"msg": "Namespace metadata 동기화 완료", "namespace": namespace}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("네임스페이스 metadata 동기화 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
 
 

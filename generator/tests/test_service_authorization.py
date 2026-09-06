@@ -115,8 +115,8 @@ def test_namespace_api_preserves_conflict_for_namespace_owned_by_another_course(
             )
 
     def init_with_existing_owner(core_v1_api, *args):
-        namespace = args[-3]
-        course_id = args[-2]
+        namespace = args[4]
+        course_id = args[5]
         generator.ensure_course_metadata(core_v1_api, namespace, course_id)
 
     monkeypatch.setattr(generator.client, "CoreV1Api", ExistingCourseMetadata)
