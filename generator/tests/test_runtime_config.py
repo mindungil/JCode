@@ -138,9 +138,8 @@ def test_existing_workspace_service_is_reconciled_without_cluster_ip(generator):
         def create_namespaced_service(self, namespace, body):
             raise generator.ApiException(status=409)
 
-        def patch_namespaced_service(self, name, namespace, body, _content_type):
+        def patch_namespaced_service(self, name, namespace, body):
             self.patch = body
-            self.content_type = _content_type
 
     core = CoreV1()
     result = generator.create_service(core, "jcode-alg-1", "workspace-svc", "workspace", True)
@@ -148,7 +147,6 @@ def test_existing_workspace_service_is_reconciled_without_cluster_ip(generator):
     assert result == "Service 'workspace-svc' 갱신 완료"
     assert core.patch[0]["value"] == {"app": "workspace"}
     assert [port["port"] for port in core.patch[1]["value"]] == [8080, 5901, 6080]
-    assert core.content_type == "application/json-patch+json"
 
 
 def runtime_namespace_core(endpoints=None, service=None):

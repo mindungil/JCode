@@ -1458,7 +1458,6 @@ def create_service(core_v1_api, namespace: str, service_name: str, app_label: st
                         ],
                     },
                 ],
-                _content_type="application/json-patch+json",
             )
             logger.info(f"Service '{service_name}' 갱신 완료")
             return f"Service '{service_name}' 갱신 완료"
