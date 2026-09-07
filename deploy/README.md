@@ -144,10 +144,11 @@ production 기능 검증 대상은 release 실행 시 `smoke_course_namespace`�
 
 ```bash
 install -m 0755 deploy/tools/kubectl-courses /usr/local/bin/kubectl-courses
-install -m 0755 deploy/tools/jc /usr/local/bin/jc
-jc      # production
-jc d    # dev
-jc a    # all
+test ! -L /usr/local/bin/k || unlink /usr/local/bin/k
+install -m 0755 deploy/tools/k /usr/local/bin/k
+k get courses             # production
+k get courses --env dev   # dev
+k get courses -A          # all
 ```
 
 ## 렌더링
