@@ -6,4 +6,5 @@ resources:
   - configmaps.yaml
   - storage.yaml
   - redis.yaml
+  - redis-sentinel.yaml
   - watcher-postgres.yaml

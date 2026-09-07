@@ -19,10 +19,23 @@ directory. Never commit their values.
 `jcode-redis-secret/REDIS_PASSWORD` and the Backend/Router Redis password must
 contain the same value.
 
+## High availability
+
+- CloudNativePG runs two asynchronous PostgreSQL instances on different worker
+  nodes. Both data volumes use two Longhorn replicas. Applications always use
+  the `watcher-postgres-rw` Service.
+- Redis runs one primary and one replica in `redis-ha`. Three persistent
+  Sentinels provide quorum-based primary discovery and failover. Backend and
+  Router must both be built from revisions that support the
+  `REDIS_SENTINEL_MASTER` and `REDIS_SENTINEL_NODES` settings.
+- Do not recreate the legacy `redis` Deployment or `redis-data` PVC after the
+  HA cutover. Retain that PVC only as a temporary rollback copy.
+
 ## Restore order
 
 1. Restore Longhorn volumes and bind the retained PVs to the PVC names in
-   `storage.yaml`. Applying an empty PVC does not restore its data.
+   `storage.yaml` and the Redis StatefulSet claim names. Applying an empty PVC
+   does not restore its data.
    The `longhorn-worker1-r1` class also requires a Longhorn disk tagged
    `worker1-storage`.
 2. Apply the non-secret state:
@@ -48,3 +61,7 @@ The refresh command is mandatory after a volume or share-manager recreation.
 CloudNativePG must be installed before applying `watcher-postgres.yaml`. On a
 fresh cluster, restore the Watcher database from backup instead of treating the
 empty `initdb` database as recovered data.
+
+After restoration, verify both PostgreSQL instances are ready, all three
+Sentinels report the same primary, and each Sentinel reports one replica and two
+other Sentinels before restarting Backend or Router.

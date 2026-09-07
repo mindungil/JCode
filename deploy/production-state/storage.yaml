@@ -33,21 +33,3 @@ spec:
   resources:
     requests:
       storage: 100Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: redis-data
-  labels:
-    app: redis
-    app.kubernetes.io/component: cache
-    app.kubernetes.io/name: redis
-  annotations:
-    description: Persistent AOF and RDB storage for Watcher Redis
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: longhorn-r2-retain
-  resources:
-    requests:
-      storage: 5Gi

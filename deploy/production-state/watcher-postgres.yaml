@@ -9,7 +9,12 @@ metadata:
 spec:
   description: JCode Watcher production PostgreSQL
   imageName: ghcr.io/cloudnative-pg/postgresql:16
-  instances: 1
+  instances: 2
+  primaryUpdateMethod: switchover
+  affinity:
+    nodeSelector:
+      kubernetes.io/os: linux
+    podAntiAffinityType: required
   bootstrap:
     initdb:
       database: watcher
@@ -23,4 +28,4 @@ spec:
       memory: 2Gi
   storage:
     size: 20Gi
-    storageClass: longhorn
+    storageClass: longhorn-r2-retain

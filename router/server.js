@@ -8,6 +8,7 @@ const axios = require('axios');
 const cookie = require('cookie'); 
 const crypto = require('crypto');
 const client = require('prom-client');  // prometheus client
+const { createRedisClient } = require('./redis-client');
 const { extractSessionId, stripProxyPrefix, isVncPath, routeKeyForProfile } = require('./session-routing');
 require('dotenv').config();
 
@@ -62,21 +63,15 @@ const SPRING_REFRESH_URL = process.env.SPRING_REFRESH_URL || "SPRING_REFRESH_URL
 const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || "localhost";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://localhost";
 
-// REDIS 정보
-const REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
-const REDIS_PORT = parseInt(process.env.REDIS_PORT) || 6379;
-const REDIS_PASSWORD = process.env.REDIS_PASSWORD || "";
-
 // Redis
-const redisOptions = { socket: { host: REDIS_HOST, port: REDIS_PORT }};
-if (REDIS_PASSWORD) {
-  redisOptions.password = REDIS_PASSWORD;
-}
-const redisClient = redis.createClient(redisOptions);
+const redisClient = createRedisClient(redis);
 redisClient.on('error', (err) => {
   console.error('Redis Client Error:', err);
 });
-redisClient.connect();
+redisClient.connect().catch((err) => {
+  console.error('FATAL: Redis connection failed:', err);
+  process.exit(1);
+});
 
 app.use(cookieParser());
 app.use(cors({
