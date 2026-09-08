@@ -1,11 +1,11 @@
 {
   "schema": 3,
   "environment": "production",
-  "capturedAt": "2026-09-07T23:50:12+09:00",
+  "capturedAt": "2026-09-08T11:52:10+09:00",
   "revisions": {
     "jcode": "de684df3484e6ef8cb7b9ab0d1398b769589ce5b",
     "backend": "527077a400955e1c83271a505f6944ddbcf5da7f",
-    "frontend": "6c5a3a82ccae02bcbfeee70fedce4b2ccaa7a2f6",
+    "frontend": "c2cc1cc4ed212fd56d5adb9e140dff6f17bd770c",
     "watcher": "0eae8f3e5f73fcc9e9da8fbb7d2b3c313568d932",
     "code_server": "ff61ac44b9f774bf436f7277fb26bb74287d4879"
   },
@@ -20,6 +20,6 @@
     "workspace_init": "sha256:aadcea977014b52c18bef4f7e16940458a7ac244ae94acfc2b864369b37c2ba3",
     "squid_exporter": "sha256:0bc67ca1ccde0d7d227c4ffbeae9963355277fceacfbcd96308191f29fd02649",
     "backend": "sha256:36ee318e9c20dc87bb7d853fb131e82b567deb1f42f2aa919e4a9ce380c5149b",
-    "frontend": "sha256:ab09857e7c972a2566b1636a907bb633edeababe6756905f6b2cc67b119116df"
+    "frontend": "sha256:bfa4ca10bd26df13a6b8793542c7b227333bf3b7f76640f10a497d12a082c4ae"
   }
 }
