@@ -288,3 +288,20 @@ def test_jcode_delete_is_idempotent_when_namespace_is_missing(generator, monkeyp
     response = asyncio.run(generator.delete_resources(request, {}))
 
     assert "이미 없습니다" in response["msg"]
+
+
+def test_jcode_delete_confirmation_waits_for_both_deployment_and_pods(generator):
+    class DeletedDeployment:
+        def read_namespaced_deployment(self, name, namespace):
+            raise generator.ApiException(status=404)
+
+    class Core:
+        def __init__(self, pods):
+            self.pods = pods
+
+        def list_namespaced_pod(self, namespace, label_selector):
+            return type("PodList", (), {"items": self.pods})()
+
+    apps = DeletedDeployment()
+    assert generator.wait_for_jcode_deleted(apps, Core([]), "jcode-os-1", "jcode-os-1-1", 0)
+    assert not generator.wait_for_jcode_deleted(apps, Core([object()]), "jcode-os-1", "jcode-os-1-1", 0)

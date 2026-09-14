@@ -149,6 +149,7 @@ active_refs=$(kubectl get ingress -n "$namespace" -o json | jq '[.items[].spec.r
 
 kubectl delete deployment jcode-generator-dev jcode-router-dev -n "$namespace" --ignore-not-found
 kubectl delete service jcode-generator-dev-svc jcode-router-dev-svc -n "$namespace" --ignore-not-found
+python3 deploy/reconcile_workspace_dns.py dev --finalize-legacy
 deploy/finalize-workspace-rbac.sh dev
 
 echo "dev traffic cutover completed; backup: $backup_dir"

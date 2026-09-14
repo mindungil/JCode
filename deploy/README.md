@@ -132,7 +132,7 @@ Router ConfigMap의 `CORS_ORIGIN`과 `COOKIE_DOMAIN`은 예시값을 그대로 �
 Longhorn RWX Workspace 볼륨은 kubelet의 클러스터 DNS 의존을 피하기 위해 share-manager Service의 현재 ClusterIP를 `NFS_SERVER`로 사용합니다.
 `ALLOWED_NETWORK_CIDR`은 해당 환경의 Workspace Pod 출발지 CIDR로 설정합니다. 배포 스크립트는 이 값으로 `squid-config`를 다시 만들고 cache-manager ACL까지 확인합니다.
 `WORKSPACE_DNS_CIDRS`는 Workspace Pod가 사용하는 DNS 주소를 쉼표로 구분해 반드시 설정합니다. 배포 시 값과 CIDR 형식을 검증한 뒤 Generator ConfigMap에 반영합니다.
-배포가 끝나면 `deploy/reconcile_workspace_dns.py`가 환경이 일치하는 기존 v2 강의 Namespace의 `workspace-egress`도 같은 설정으로 갱신합니다. 강의 metadata 또는 v2 RoleBinding이 없는 기존 Namespace는 변경하지 않습니다.
+배포가 끝나면 `deploy/reconcile_workspace_dns.py`가 임시 `legacy-workspace-egress`를 먼저 둔 상태에서 환경이 일치하는 기존 v2 강의 Namespace의 정책을 갱신합니다. 모든 Workspace Deployment에 `jcode/session-kind`가 반영된 뒤 cutover/finalize 스크립트가 `--finalize-legacy` 검사를 통과해야 임시 허용 정책을 제거합니다. 강의 metadata 또는 v2 RoleBinding이 없는 기존 Namespace는 변경하지 않습니다.
 Kubernetes NetworkPolicy는 여러 정책의 허용 규칙이 합산됩니다. 외부 클러스터 설정에 같은 Pod를 넓게 허용하는 정책이 있으면 이 저장소의 제한 정책이 무력화되므로, 해당 정책도 클러스터 설정의 source-of-truth에서 제거하거나 범위를 축소해야 합니다.
 
 course metadata가 없는 기존 Namespace는 `deploy/legacy-namespace-plan.json`에 환경별로 명시합니다.

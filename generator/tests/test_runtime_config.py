@@ -68,6 +68,7 @@ def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, m
         "20260001",
         False,
         False,
+        assignment_dirs=["assignment-7", "assignment-9"],
     )
 
     pod_spec = apps.deployment.spec.template.spec
@@ -86,23 +87,97 @@ def test_workspace_persists_only_extensions_and_has_readiness_probe(generator, m
     assert "/home/coder/.local" not in " ".join(pod_spec.init_containers[0].command)
     assert "/home/coder/extensions" not in " ".join(pod_spec.init_containers[0].command)
     init_command = " ".join(pod_spec.init_containers[0].command)
-    assert "/home/coder/project/workspace" in init_command
+    assert init_command.endswith("true")
     assert "/home/coder/project/hw" not in init_command
     assert "/home/coder/project/prac" not in init_command
     assert runtime.readiness_probe.tcp_socket.port == 8080
+    assert pod_spec.hostname == "jcode-alg-1-20260001"
     assert apps.deployment.spec.progress_deadline_seconds == 600
+    assert apps.deployment.spec.strategy.type == "Recreate"
+    assert all(
+        mount.mount_path != "/home/coder/project"
+        for mount in runtime.volume_mounts
+    )
+    assert any(
+        mount.mount_path == "/home/coder/project/workspace"
+        and mount.sub_path == "workspace/alg-1-20260001/workspace"
+        for mount in runtime.volume_mounts
+    )
+    assert {
+        (mount.mount_path, mount.sub_path)
+        for mount in runtime.volume_mounts
+        if mount.mount_path.startswith("/home/coder/project/assignments/")
+    } == {
+        (
+            "/home/coder/project/assignments/assignment-7",
+            "workspace/alg-1-20260001/assignment-7",
+        ),
+        (
+            "/home/coder/project/assignments/assignment-9",
+            "workspace/alg-1-20260001/assignment-9",
+        ),
+    }
+
+
+def test_inspector_mounts_only_one_assignment_read_only(generator, monkeypatch):
+    class AppsV1:
+        def __init__(self):
+            self.deployment = None
+
+        def create_namespaced_deployment(self, namespace, body):
+            self.deployment = body
+
+    monkeypatch.setattr(generator, "get_requested_workspace_image", lambda *_: "harbor/image@sha256:" + "a" * 64)
+    monkeypatch.setattr(generator, "get_workspace_init_image", lambda: "harbor/init@sha256:" + "b" * 64)
+    monkeypatch.setattr(generator, "get_workspace_resources", lambda *_: generator.client.V1ResourceRequirements())
+    monkeypatch.setattr(generator, "get_image_pull_secret_names", lambda: [])
+    apps = AppsV1()
+
+    generator.create_deployment(
+        apps,
+        "jcode-alg-1",
+        "jinspect-1-2-7-abcd1234",
+        "jinspect-1-2-7-abcd1234",
+        "workspace/alg-1-20260001",
+        "20260001",
+        False,
+        False,
+        workspace_scope="ASSIGNMENT",
+        assignment_workspace_key="assignment-7",
+        session_kind="INSPECTOR",
+        read_only_workspace=True,
+    )
+
+    pod = apps.deployment.spec.template
+    runtime = pod.spec.containers[0]
+    project_mount = next(
+        mount for mount in runtime.volume_mounts
+        if mount.mount_path == "/home/coder/project"
+    )
+    assert project_mount.sub_path == "workspace/alg-1-20260001/assignment-7"
+    assert project_mount.read_only is True
+    assert pod.metadata.labels["jcode/session-kind"] == "inspector"
+    assert all(
+        not mount.mount_path.startswith("/home/coder/project/assignments/")
+        for mount in runtime.volume_mounts
+    )
 
 
 def test_existing_workspace_deployment_is_reconciled(generator, monkeypatch):
     class AppsV1:
         def __init__(self):
-            self.patched = None
+            self.replaced = None
 
         def create_namespaced_deployment(self, namespace, body):
             raise generator.ApiException(status=409)
 
-        def patch_namespaced_deployment(self, name, namespace, body):
-            self.patched = body
+        def read_namespaced_deployment(self, name, namespace):
+            return generator.client.V1Deployment(
+                metadata=generator.client.V1ObjectMeta(resource_version="7")
+            )
+
+        def replace_namespaced_deployment(self, name, namespace, body):
+            self.replaced = body
 
     monkeypatch.setattr(generator, "get_requested_workspace_image", lambda *_: "harbor/image@sha256:" + "a" * 64)
     monkeypatch.setattr(generator, "get_workspace_init_image", lambda: "harbor/init@sha256:" + "b" * 64)
@@ -122,7 +197,8 @@ def test_existing_workspace_deployment_is_reconciled(generator, monkeypatch):
     )
 
     assert result == "Deployment 'jcode-alg-1-20260001' 갱신 완료"
-    runtime = apps.patched.spec.template.spec.containers[0]
+    assert apps.replaced.metadata.resource_version == "7"
+    runtime = apps.replaced.spec.template.spec.containers[0]
     assert next(item.value for item in runtime.env if item.name == "EXTENSIONS_GALLERY") == "{}"
     assert next(
         mount.read_only for mount in runtime.volume_mounts
@@ -518,26 +594,6 @@ def test_workspace_scheduling_config_rejects_invalid_json(generator, monkeypatch
 
     with pytest.raises(RuntimeError, match="key/value"):
         generator.get_workspace_node_selector()
-
-
-def test_watcher_hook_config_is_created_and_contains_dynamic_assignment_lookup(generator):
-    class CoreV1:
-        def __init__(self):
-            self.created = None
-
-        def read_namespaced_config_map(self, name, namespace):
-            raise generator.ApiException(status=404)
-
-        def create_namespaced_config_map(self, namespace, body):
-            self.created = body
-
-    core_v1 = CoreV1()
-    generator.ensure_watcher_hook_config(core_v1, "jcode-course-1")
-
-    assert core_v1.created.metadata.name == "watcher-hook-config"
-    hook = core_v1.created.data["99-watcher-hook.py"]
-    assert "relative_to(WORKSPACE_ROOT)" in hook
-    assert "post_with_retry" in hook
 
 
 def test_managed_config_map_is_replaced_with_resource_version(generator):

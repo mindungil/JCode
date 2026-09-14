@@ -71,6 +71,12 @@ class Kubectl:
             check=True,
         )
 
+    def delete_network_policy(self, namespace: str, name: str) -> None:
+        subprocess.run(
+            ["kubectl", "delete", "networkpolicy", name, "-n", namespace, "--ignore-not-found"],
+            check=True,
+        )
+
 
 def parse_dns_cidrs(value: str) -> list[str]:
     configured = [item.strip() for item in value.split(",") if item.strip()]
@@ -114,7 +120,11 @@ def load_runtime_config(configmap: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_workspace_egress(namespace: str, runtime: dict[str, Any]) -> dict[str, Any]:
+def build_workspace_egress(
+    namespace: str,
+    runtime: dict[str, Any],
+    allow_package_proxy: bool = True,
+) -> dict[str, Any]:
     dns_peers = [
         {
             "namespaceSelector": {
@@ -124,50 +134,129 @@ def build_workspace_egress(namespace: str, runtime: dict[str, Any]) -> dict[str,
         }
     ]
     dns_peers.extend({"ipBlock": {"cidr": cidr}} for cidr in runtime["dns_cidrs"])
+    egress = [
+        {
+            "to": dns_peers,
+            "ports": [
+                {"port": 53, "protocol": "UDP"},
+                {"port": 53, "protocol": "TCP"},
+            ],
+        }
+    ]
+    if allow_package_proxy:
+        egress.append(
+            {
+                "to": [
+                    {
+                        "namespaceSelector": {
+                            "matchLabels": {
+                                "kubernetes.io/metadata.name": runtime["proxy_namespace"]
+                            }
+                        },
+                        "podSelector": {
+                            "matchLabels": {"app": runtime["proxy_label"]}
+                        },
+                    }
+                ],
+                "ports": [{"port": runtime["proxy_port"], "protocol": "TCP"}],
+            }
+        )
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": {"name": "workspace-egress", "namespace": namespace},
         "spec": {
+            "podSelector": {
+                "matchLabels": {
+                    "jcode/component": "workspace",
+                    "jcode/session-kind": "standard",
+                }
+            },
+            "policyTypes": ["Egress"],
+            "egress": egress,
+        },
+    }
+
+
+def existing_policy_allows_package_proxy(
+    policy: Optional[dict[str, Any]], runtime: dict[str, Any]
+) -> bool:
+    if policy is None:
+        # Legacy namespaces predate per-course egress selection and used the package proxy.
+        return True
+    for rule in (policy.get("spec") or {}).get("egress") or []:
+        ports = rule.get("ports") or []
+        if not any(port.get("port") == runtime["proxy_port"] for port in ports):
+            continue
+        for peer in rule.get("to") or []:
+            namespace_labels = (peer.get("namespaceSelector") or {}).get("matchLabels") or {}
+            pod_labels = (peer.get("podSelector") or {}).get("matchLabels") or {}
+            if (
+                namespace_labels.get("kubernetes.io/metadata.name") == runtime["proxy_namespace"]
+                and pod_labels.get("app") == runtime["proxy_label"]
+            ):
+                return True
+    return False
+
+
+def build_workspace_default_deny_egress(namespace: str) -> dict[str, Any]:
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": "workspace-default-deny-egress", "namespace": namespace},
+        "spec": {
             "podSelector": {"matchLabels": {"jcode/component": "workspace"}},
             "policyTypes": ["Egress"],
-            "egress": [
-                {
-                    "to": dns_peers,
-                    "ports": [
-                        {"port": 53, "protocol": "UDP"},
-                        {"port": 53, "protocol": "TCP"},
-                    ],
-                },
-                {
-                    "to": [
-                        {
-                            "namespaceSelector": {
-                                "matchLabels": {
-                                    "kubernetes.io/metadata.name": runtime["watcher_namespace"]
-                                }
-                            },
-                            "podSelector": {"matchLabels": {"app": "watcher-backend"}},
-                        }
-                    ],
-                    "ports": [{"port": 3000, "protocol": "TCP"}],
-                },
-                {
-                    "to": [
-                        {
-                            "namespaceSelector": {
-                                "matchLabels": {
-                                    "kubernetes.io/metadata.name": runtime["proxy_namespace"]
-                                }
-                            },
-                            "podSelector": {
-                                "matchLabels": {"app": runtime["proxy_label"]}
-                            },
-                        }
-                    ],
-                    "ports": [{"port": runtime["proxy_port"], "protocol": "TCP"}],
-                },
-            ],
+            "egress": [],
+        },
+    }
+
+
+def build_legacy_workspace_egress(
+    namespace: str,
+    runtime: dict[str, Any],
+    allow_package_proxy: bool,
+) -> dict[str, Any]:
+    policy = build_workspace_egress(namespace, runtime, allow_package_proxy)
+    policy["metadata"]["name"] = "legacy-workspace-egress"
+    policy["spec"]["podSelector"] = {
+        "matchLabels": {"jcode/component": "workspace"},
+        "matchExpressions": [
+            {
+                "key": "jcode/session-kind",
+                "operator": "DoesNotExist",
+            }
+        ],
+    }
+    return policy
+
+
+def legacy_workspace_deployments(kubectl: Kubectl, namespace: str) -> list[str]:
+    deployments = kubectl.get_json("deployments", namespace=namespace) or {"items": []}
+    legacy = []
+    for deployment in deployments.get("items") or []:
+        metadata = deployment.get("metadata") or {}
+        template = (((deployment.get("spec") or {}).get("template") or {}).get("metadata") or {})
+        labels = template.get("labels") or {}
+        if labels.get("jcode/component") == "workspace" and not labels.get("jcode/session-kind"):
+            legacy.append(str(metadata.get("name") or "<unnamed>"))
+    return sorted(legacy)
+
+
+def build_deny_egress(namespace: str, session_kind: str) -> dict[str, Any]:
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": f"{session_kind}-deny-egress", "namespace": namespace},
+        "spec": {
+            "podSelector": {
+                "matchLabels": {
+                    "jcode/component": "workspace",
+                    "jcode/session-kind": session_kind,
+                }
+            },
+            "policyTypes": ["Egress"],
+            "egress": [],
         },
     }
 
@@ -211,7 +300,7 @@ def is_managed_v2_namespace(
     )
 
 
-def reconcile(kubectl: Kubectl, target: Target) -> list[str]:
+def reconcile(kubectl: Kubectl, target: Target, finalize_legacy: bool = False) -> list[str]:
     configmap = kubectl.get_json(
         "configmap",
         target.configmap_name,
@@ -226,7 +315,37 @@ def reconcile(kubectl: Kubectl, target: Target) -> list[str]:
         namespace = ((item.get("metadata") or {}).get("name") or "").strip()
         if not namespace or not is_managed_v2_namespace(kubectl, target, namespace):
             continue
-        kubectl.upsert_network_policy(namespace, build_workspace_egress(namespace, runtime))
+        existing_egress = kubectl.get_json(
+            "networkpolicy",
+            "workspace-egress",
+            namespace=namespace,
+            optional=True,
+        )
+        allow_package_proxy = existing_policy_allows_package_proxy(existing_egress, runtime)
+        # Apply the compatibility allow before default-deny so existing Pods cannot
+        # lose DNS/package access between policy updates.
+        kubectl.upsert_network_policy(
+            namespace,
+            build_legacy_workspace_egress(namespace, runtime, allow_package_proxy),
+        )
+        kubectl.upsert_network_policy(namespace, build_workspace_default_deny_egress(namespace))
+        kubectl.upsert_network_policy(
+            namespace,
+            build_workspace_egress(
+                namespace,
+                runtime,
+                allow_package_proxy,
+            ),
+        )
+        kubectl.upsert_network_policy(namespace, build_deny_egress(namespace, "inspector"))
+        kubectl.upsert_network_policy(namespace, build_deny_egress(namespace, "snapshot"))
+        if finalize_legacy:
+            legacy = legacy_workspace_deployments(kubectl, namespace)
+            if legacy:
+                raise RuntimeError(
+                    f"legacy Workspace Deployment remains in {namespace}: {', '.join(legacy)}"
+                )
+            kubectl.delete_network_policy(namespace, "legacy-workspace-egress")
         updated.append(namespace)
         print(f"updated workspace-egress: {namespace}")
     print(f"workspace DNS reconciliation complete: {len(updated)} namespace(s)")
@@ -246,8 +365,17 @@ def main() -> None:
     parser.add_argument("target", choices=("dev", "prod", "production"))
     parser.add_argument("--namespace")
     parser.add_argument("--configmap")
+    parser.add_argument(
+        "--finalize-legacy",
+        action="store_true",
+        help="remove the temporary legacy egress only after all Workspace Deployments are labeled",
+    )
     args = parser.parse_args()
-    reconcile(Kubectl(), parse_target(args.target, args.namespace, args.configmap))
+    reconcile(
+        Kubectl(),
+        parse_target(args.target, args.namespace, args.configmap),
+        finalize_legacy=args.finalize_legacy,
+    )
 
 
 if __name__ == "__main__":

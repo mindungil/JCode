@@ -9,7 +9,16 @@ const cookie = require('cookie');
 const crypto = require('crypto');
 const client = require('prom-client');  // prometheus client
 const { createRedisClient } = require('./redis-client');
-const { extractSessionId, stripProxyPrefix, isVncPath, routeKeyForProfile } = require('./session-routing');
+const {
+  extractSessionId,
+  stripProxyPrefix,
+  isVncPath,
+  routeKeyForProfile,
+  parseRouteValue,
+  isRouteCurrent,
+  profileAccessRequirement,
+  metricRoute,
+} = require('./session-routing');
 require('dotenv').config();
 
 const app = express();
@@ -41,7 +50,7 @@ app.get('/metrics', async (req, res) => {
 // 미들웨어 예시: 각 요청마다 카운터 증가  ( /metrics 라우트는 카운트 하지 않기 위해 이후로 배치 )
 app.use((req, res, next) => {
   res.on('finish', () => {
-    httpRequestCounter.labels(req.method, req.path, res.statusCode).inc();
+    httpRequestCounter.labels(req.method, metricRoute(req.path), res.statusCode).inc();
   });
   next();
 });
@@ -132,15 +141,13 @@ const cookieOptions = {
 };
 
 async function canAccessUserProfile(decoded, userProfile) {
-  const { sub, role } = decoded || {};
-  const { courseCode, clss, email } = userProfile || {};
-  if (!sub || !courseCode || !clss || !email) {
-    return false;
-  }
-  if (role === "ADMIN" || sub === email) {
-    return true;
-  }
-  return redisClient.sIsMember(`course:${courseCode}:${clss}:managers`, sub);
+  const requirement = profileAccessRequirement(decoded, userProfile);
+  if (requirement === 'allow') return true;
+  if (requirement === 'deny') return false;
+  return redisClient.sIsMember(
+    `course:${userProfile.courseCode}:${userProfile.clss}:managers`,
+    decoded.sub
+  );
 }
 
 const refreshRequests = new Map();
@@ -253,8 +260,17 @@ async function loadSession(req, res, uuid) {
       return false;
     }
 
-    // 프로필 접근 시 TTL 초기화 (6시간)
-    await redisClient.expire(redisKey, 6 * 3600);
+    const legacyProfile = !userProfile.routeVersion || userProfile.routeVersion === '2';
+    const expiresAt = Number.parseInt(userProfile.expiresAt || '0', 10);
+    const remainingTtl = legacyProfile
+      ? await redisClient.ttl(redisKey)
+      : Math.min(6 * 3600, expiresAt - Math.floor(Date.now() / 1000));
+    if (remainingTtl <= 0) {
+      await redisClient.del(redisKey);
+      closeWindowWithMessage(res, 403, "프로젝트 접근 시간이 종료되었습니다.");
+      return false;
+    }
+    if (!legacyProfile) await redisClient.expire(redisKey, remainingTtl);
     
     const { courseCode, clss, email: studentEmail } = userProfile;
     if (!courseCode || !clss || !studentEmail) {
@@ -272,13 +288,14 @@ async function loadSession(req, res, uuid) {
     
     // targetUrl 조회
     const redisKeyForTarget = routeKeyForProfile(userProfile);
-    const resolvedTargetUrl = await redisClient.get(redisKeyForTarget);
-    if (!resolvedTargetUrl) {
+    const route = parseRouteValue(await redisClient.get(redisKeyForTarget));
+    if (!isRouteCurrent(userProfile, route)) {
       closeWindowWithMessage(res, 403, "프로젝트 URL을 찾을 수 없습니다.");
       return false;
     }
-    req.targetUrl = resolvedTargetUrl;
-    console.log(`Resolved targetUrl for ${studentEmail}: ${resolvedTargetUrl}`);
+    req.targetUrl = route.url;
+    req.jcodeSession = { profileKey: redisKey, routeKey: redisKeyForTarget, profile: userProfile };
+    console.log(`Resolved targetUrl for ${studentEmail}: ${route.url}`);
     
     return true;
   } catch (error) {
@@ -315,6 +332,8 @@ const proxy = createProxyMiddleware({
     return newPath;
   },
   router: (req) => {
+    // Upgrade requests have already resolved and authorized their WS target.
+    if (req.wsTargetUrl) return req.wsTargetUrl;
     // VNC 요청(`/jcode/proxy/6080`)이면 `targetUrl`을 `vncTargetUrl`로 변환
     if (isVncPath(req.originalUrl || req.url)) {
       if (req.targetUrl) {
@@ -323,7 +342,7 @@ const proxy = createProxyMiddleware({
       console.log(`VNC Proxying request => target: ${req.vncTargetUrl}`);
       return req.vncTargetUrl;
     }
-    return req.wsTargetUrl || req.targetUrl;
+    return req.targetUrl;
   },
 });
 
@@ -359,6 +378,53 @@ app.post('/jcode-logout', ensureAuthenticated, async (req, res) => {
 const server = app.listen(port, () => {
   console.log(`Node.js server listening on port ${port}`);
 });
+
+const activeSockets = new Map();
+function removeActiveSocket(socket) {
+  const session = activeSockets.get(socket);
+  if (session?.expiryTimer) clearTimeout(session.expiryTimer);
+  activeSockets.delete(socket);
+}
+
+let checkingSockets = false;
+const socketPolicyTimer = setInterval(async () => {
+  if (checkingSockets || activeSockets.size === 0) return;
+  checkingSockets = true;
+  try {
+    for (const [socket, session] of activeSockets.entries()) {
+      if (socket.destroyed) {
+        removeActiveSocket(socket);
+        continue;
+      }
+      const [profile, routeValue] = await Promise.all([
+        redisClient.hGetAll(session.profileKey),
+        redisClient.get(session.routeKey),
+      ]);
+      const route = parseRouteValue(routeValue);
+      if (
+        !profile ||
+        Object.keys(profile).length === 0 ||
+        !isRouteCurrent(profile, route) ||
+        !await canAccessUserProfile(session.decoded, profile)
+      ) {
+        socket.destroy();
+        removeActiveSocket(socket);
+      }
+    }
+  } catch (error) {
+    console.error('WebSocket policy check failed:', error.message);
+    // Authorization state cannot be proven while Redis is unavailable. Keeping
+    // established IDE tunnels alive here would turn a policy-store outage into
+    // an access-control bypass, so close them and require a fresh launch.
+    for (const socket of activeSockets.keys()) {
+      socket.destroy();
+      removeActiveSocket(socket);
+    }
+  } finally {
+    checkingSockets = false;
+  }
+}, Number.parseInt(process.env.SOCKET_POLICY_INTERVAL_MS || '5000', 10));
+socketPolicyTimer.unref();
 
 // WebSocket upgrade
 server.on('upgrade', async (req, socket, head) => {
@@ -400,13 +466,13 @@ server.on('upgrade', async (req, socket, head) => {
     }
 
     const redisKeyForTarget = routeKeyForProfile(userProfile);
-    const ideTargetUrl = await redisClient.get(redisKeyForTarget);
-    if (!ideTargetUrl) {
+    const route = parseRouteValue(await redisClient.get(redisKeyForTarget));
+    if (!isRouteCurrent(userProfile, route)) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\nMissing targetUrl in Redis');
       socket.destroy();
       return;
     }
-    let wsTargetUrl = ideTargetUrl
+    let wsTargetUrl = route.url
       .replace(/^http:/, 'ws:')
       .replace(/^https:/, 'wss:');
 
@@ -417,6 +483,21 @@ server.on('upgrade', async (req, socket, head) => {
     
     console.log(`WebSocket upgrade: ${email} => ${wsTargetUrl}`);
     req.wsTargetUrl = wsTargetUrl;
+    const expiresAtMs = Number.parseInt(userProfile.expiresAt, 10) * 1000;
+    const expiryTimer = Number.isFinite(expiresAtMs) ? setTimeout(() => {
+      socket.destroy();
+      removeActiveSocket(socket);
+    }, Math.max(0, expiresAtMs - Date.now())) : null;
+    if (expiryTimer) expiryTimer.unref();
+    activeSockets.set(socket, {
+      profileKey: `user:profile:${jcodeUuid}`,
+      routeKey: redisKeyForTarget,
+      decoded,
+      expiryTimer,
+    });
+    const removeSocket = () => removeActiveSocket(socket);
+    socket.once('close', removeSocket);
+    socket.once('error', removeSocket);
     proxy.upgrade(req, socket, head);
   } catch (err) {
     console.error("Error in WebSocket upgrade:", err.message);

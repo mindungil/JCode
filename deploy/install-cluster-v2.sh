@@ -57,6 +57,7 @@ fi
 deploy/migrate-course-metadata.sh prod
 deploy/migrate-workspace-rbac.sh prod
 kubectl apply -f "$metadata_policy"
+python3 deploy/reconcile_workspace_dns.py prod --finalize-legacy
 deploy/finalize-workspace-rbac.sh prod
 
 echo "production v2 permissions finalized"

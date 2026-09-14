@@ -4,6 +4,7 @@ import io
 import json
 import os
 import stat
+import time
 import zipfile
 from types import SimpleNamespace
 
@@ -16,6 +17,27 @@ def make_zip(path, files):
             archive.writestr(name, content)
 
 
+def test_stale_nfs_lock_replacement_never_lets_old_owner_remove_new_lock(generator, tmp_path):
+    lock = tmp_path / "workspace.lock"
+    old_owner = generator.try_acquire_directory_lock(lock, 300)
+    assert old_owner is not None
+    stale_time = time.time() - 600
+    os.utime(lock, (stale_time, stale_time))
+
+    new_owner = generator.try_acquire_directory_lock(lock, 300)
+    assert new_owner is not None
+    assert new_owner != old_owner
+
+    with generator.keep_directory_lock_alive(lock, 300, old_owner):
+        pass
+    assert lock.is_dir()
+    assert generator.read_lock_owner(lock) == new_owner
+
+    with generator.keep_directory_lock_alive(lock, 300, new_owner):
+        pass
+    assert not lock.exists()
+
+
 def test_environment_profiles_reject_inconsistent_presets(generator):
     with pytest.raises(generator.HTTPException) as error:
         generator.validate_workspace_profile(
@@ -26,6 +48,51 @@ def test_environment_profiles_reject_inconsistent_presets(generator):
     generator.validate_workspace_profile(
         "LAB", True, True, None, "STANDARD", "PACKAGE_PROXY", "COURSE"
     )
+
+
+def test_inspector_session_must_be_assignment_scoped_and_read_only(generator):
+    request = generator.DeployRequest(
+        course_id=1,
+        namespace="jcode-os-1",
+        deployment_name="jinspect-1",
+        service_name="jinspect-1-svc",
+        app_label="jinspect-1",
+        file_path="workspace/os-1-20260001",
+        student_num="20260001",
+        use_vnc=False,
+        workspace_scope="ASSIGNMENT",
+        assignment_workspace_key="assignment-7",
+        use_snapshot=False,
+        mount_hash="0" * 64,
+        session_kind="INSPECTOR",
+        read_only_workspace=True,
+    )
+
+    generator.validate_deploy_session(request)
+    with pytest.raises(generator.HTTPException):
+        generator.validate_deploy_session(request.model_copy(update={"read_only_workspace": False}))
+    with pytest.raises(generator.HTTPException):
+        generator.validate_deploy_session(request.model_copy(update={"workspace_scope": "COURSE"}))
+
+
+def test_legacy_snapshot_request_is_normalized_during_rolling_upgrade(generator):
+    request = generator.DeployRequest(
+        course_id=1,
+        namespace="jcode-os-1",
+        deployment_name="jcode-snapshot-os-20260001",
+        service_name="jcode-snapshot-os-20260001-svc",
+        app_label="jcode-snapshot-os-20260001",
+        file_path="os-1",
+        student_num="20260001",
+        use_vnc=False,
+        workspace_scope="ASSIGNMENT",
+        use_snapshot=True,
+        mount_hash="0" * 64,
+    )
+
+    generator.validate_deploy_session(request)
+
+    assert request.session_kind == "SNAPSHOT"
 
 
 def test_course_namespace_annotations_are_human_readable(generator, monkeypatch):
@@ -128,6 +195,24 @@ def test_starter_distribution_preserves_or_replaces_student_files(generator, mon
         generator.verify_artifact_checksum(artifact, "0" * 64)
 
 
+def test_starter_replace_retry_does_not_overwrite_new_student_work(generator, monkeypatch, tmp_path):
+    monkeypatch.setattr(os, "chown", lambda *_: None)
+    artifact = tmp_path / "starter.zip"
+    make_zip(artifact, {"main.py": "starter"})
+    target = tmp_path / "assignment-1"
+    operation_key = "00000000-0000-0000-0000-000000000042"
+
+    assert generator.apply_starter_artifact(
+        artifact, target, "REPLACE_ALL", operation_key
+    ) is True
+    (target / "main.py").write_text("student", encoding="utf-8")
+
+    assert generator.apply_starter_artifact(
+        artifact, target, "REPLACE_ALL", operation_key
+    ) is False
+    assert (target / "main.py").read_text(encoding="utf-8") == "student"
+
+
 def test_starter_distribution_rejects_student_symlink(generator, monkeypatch, tmp_path):
     artifact = tmp_path / "starter.zip"
     make_zip(artifact, {"main.py": "starter"})
@@ -155,7 +240,7 @@ def test_starter_upload_validation_rejects_symlink_member(generator, tmp_path):
             generator.validate_zip_archive(archive, str(tmp_path / "extract"))
 
 
-def test_assignment_path_migration_is_idempotent(generator, monkeypatch, tmp_path):
+def test_assignment_path_migration_is_idempotent_without_exposing_descriptor(generator, monkeypatch, tmp_path):
     workspace_root = tmp_path / "workspace"
     student = workspace_root / "os-1-20260001"
     legacy = student / "old-name"
@@ -175,31 +260,26 @@ def test_assignment_path_migration_is_idempotent(generator, monkeypatch, tmp_pat
         display_name="자료구조 첫 과제",
     )
 
-    first = asyncio.run(generator.provision_assignment_workspace(request, {}))
-    second = asyncio.run(generator.provision_assignment_workspace(request, {}))
+    operation_key = "00000000-0000-0000-0000-000000000071"
+    first = asyncio.run(generator.provision_assignment_workspace(request, operation_key, {}))
+    second = asyncio.run(generator.provision_assignment_workspace(request, operation_key, {}))
 
     assert first["migrated"] == 1
-    assert second == {"workspace_key": "assignment-7", "migrated": 0, "created": 0}
+    assert first["completed"] is True
+    assert second["migrated"] == 1
+    assert second["created"] == 0
+    assert second["completed"] is True
     assert (student / "assignment-7" / "answer.py").is_file()
-    descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text())
-    assert descriptor["folders"] == [{"name": "자료구조 첫 과제", "path": "../assignment-7"}]
-    assert descriptor["settings"]["chat.disableAIFeatures"] is True
-    named = json.loads(
-        (student / ".jcode" / "assignments" / "assignment-7" / "자료구조 첫 과제.code-workspace").read_text()
-    )
-    assert named["folders"] == [{"name": "자료구조 첫 과제", "path": "../../../assignment-7"}]
+    assert not (student / ".jcode" / "assignment-7.code-workspace").exists()
 
     renamed = request.model_copy(update={"display_name": "자료구조 수정 과제"})
-    third = asyncio.run(generator.provision_assignment_workspace(renamed, {}))
-    descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text())
-    assert third == {"workspace_key": "assignment-7", "migrated": 0, "created": 0}
-    assert descriptor["folders"][0]["name"] == "자료구조 수정 과제"
-    assert not (
-        student / ".jcode" / "assignments" / "assignment-7" / "자료구조 첫 과제.code-workspace"
-    ).exists()
-    assert (
-        student / ".jcode" / "assignments" / "assignment-7" / "자료구조 수정 과제.code-workspace"
-    ).is_file()
+    third = asyncio.run(generator.provision_assignment_workspace(
+        renamed, "00000000-0000-0000-0000-000000000072", {}
+    ))
+    assert third["migrated"] == 0
+    assert third["created"] == 0
+    assert third["completed"] is True
+    assert not (student / ".jcode" / "assignment-7.code-workspace").exists()
 
 
 def test_general_workspace_shows_user_and_named_assignments(generator, monkeypatch, tmp_path):
@@ -221,9 +301,9 @@ def test_general_workspace_shows_user_and_named_assignments(generator, monkeypat
     descriptor = json.loads((student / ".jcode" / "홍길동의 JCode.code-workspace").read_text())
     assert descriptor["folders"] == [
         {"name": "내 작업공간", "path": "../workspace"},
-        {"name": "자료구조 첫 과제", "path": "../assignment-7"},
-        {"name": "알고리즘 실습", "path": "../assignment-9"},
-        {"name": "마지막 과제", "path": "../assignment-10"},
+        {"name": "자료구조 첫 과제", "path": "../assignments/assignment-7"},
+        {"name": "알고리즘 실습", "path": "../assignments/assignment-9"},
+        {"name": "마지막 과제", "path": "../assignments/assignment-10"},
     ]
     assert descriptor["settings"]["chat.disableAIFeatures"] is True
     assert descriptor["settings"]["chat.commandCenter.enabled"] is False
@@ -244,11 +324,86 @@ def test_general_workspace_shows_user_and_named_assignments(generator, monkeypat
     descriptor = json.loads((student / ".jcode" / "홍길동의 JCode.code-workspace").read_text())
     assert descriptor["folders"] == [
         {"name": "내 작업공간", "path": "../workspace"},
-        {"name": "마지막 과제", "path": "../assignment-10"},
+        {"name": "마지막 과제", "path": "../assignments/assignment-10"},
     ]
     assert (student / "assignment-9").is_dir()
     assert not (student / ".jcode" / "assignment-9.code-workspace").exists()
     assert not (student / ".jcode" / "assignments" / "assignment-9").exists()
+
+
+def test_workspace_operation_is_resumed_in_bounded_batches(generator, monkeypatch, tmp_path):
+    workspace_root = tmp_path / "workspace"
+    for student_number in ("20260001", "20260002"):
+        (workspace_root / f"os-1-{student_number}").mkdir(parents=True)
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(generator, "COURSE_NAMESPACE_PREFIX", "jcode-")
+    monkeypatch.setenv("WORKSPACE_OPERATION_BATCH_SIZE", "1")
+    processed = []
+
+    def worker(student_dir):
+        processed.append(student_dir.name)
+        return {"changed": 1}
+
+    first = generator.process_workspace_batch(
+        "jcode-os-1", "00000000-0000-0000-0000-000000000081",
+        "test-batch", "fingerprint", worker
+    )
+    second = generator.process_workspace_batch(
+        "jcode-os-1", "00000000-0000-0000-0000-000000000081",
+        "test-batch", "fingerprint", worker
+    )
+    third = generator.process_workspace_batch(
+        "jcode-os-1", "00000000-0000-0000-0000-000000000081",
+        "test-batch", "fingerprint", worker
+    )
+
+    assert first == {
+        "completed": False,
+        "processed": 1,
+        "processed_students": ["os-1-20260001"],
+        "total": 2,
+        "changed": 1,
+    }
+    assert second == {
+        "completed": True,
+        "processed": 2,
+        "processed_students": ["os-1-20260001", "os-1-20260002"],
+        "total": 2,
+        "changed": 2,
+    }
+    assert third == second
+    assert processed == ["os-1-20260001", "os-1-20260002"]
+
+
+def test_workspace_batch_reprocesses_recreated_student_directory(generator, monkeypatch, tmp_path):
+    workspace_root = tmp_path / "workspace"
+    student = workspace_root / "os-1-20260001"
+    student.mkdir(parents=True)
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(generator, "COURSE_NAMESPACE_PREFIX", "jcode-")
+    monkeypatch.setattr(os, "chown", lambda *_: None)
+    processed = []
+
+    def worker(student_dir):
+        processed.append(student_dir.name)
+        return {"changed": 1}
+
+    operation_key = "00000000-0000-0000-0000-000000000082"
+    first = generator.process_workspace_batch(
+        "jcode-os-1", operation_key, "test-recreated", "fingerprint", worker
+    )
+    old_identity = generator.read_workspace_identity(student)
+    archived = tmp_path / "archived-student"
+    student.rename(archived)
+    student.mkdir()
+    second = generator.process_workspace_batch(
+        "jcode-os-1", operation_key, "test-recreated", "fingerprint", worker
+    )
+
+    assert first["completed"] is True
+    assert second["completed"] is True
+    assert generator.read_workspace_identity(student) != old_identity
+    assert processed == ["os-1-20260001", "os-1-20260001"]
 
 
 def test_general_workspace_filename_rejects_path_characters(generator):
@@ -285,7 +440,9 @@ def test_student_archive_continues_when_namespace_is_already_missing(generator, 
         archive_key="12345678-1234-1234-1234-123456789abc",
     )
 
-    response = asyncio.run(generator.archive_student_workspace(request, {}))
+    response = asyncio.run(generator.archive_student_workspace(
+        request, "00000000-0000-0000-0000-000000000091", {}
+    ))
 
     destination = archive_root / "memberships" / "os-1" / "20260001" / request.archive_key
     assert response["archived"] is True
@@ -322,7 +479,9 @@ def test_student_archive_does_not_touch_a_reused_namespace(generator, monkeypatc
         archive_key="12345678-1234-1234-1234-123456789abc",
     )
 
-    response = asyncio.run(generator.archive_student_workspace(request, {}))
+    response = asyncio.run(generator.archive_student_workspace(
+        request, "00000000-0000-0000-0000-000000000092", {}
+    ))
 
     assert response == {
         "archived": True,
@@ -372,3 +531,44 @@ def test_reopen_prepares_workspace_for_student_without_final_archive(generator, 
 
     assert moved == 1
     assert (student / "assignment-7" / "main.py").read_text(encoding="utf-8") == "starter"
+    assert not (student / ".jcode" / "assignment-7.code-workspace").exists()
+
+
+def test_reopen_rejects_existing_workspace_when_final_archive_is_missing(generator, monkeypatch, tmp_path):
+    student = tmp_path / "workspace" / "os-1-20260001"
+    assignment = student / "assignment-7"
+    assignment.mkdir(parents=True)
+    (assignment / "answer.py").write_text("unverified", encoding="utf-8")
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(generator, "COURSE_NAMESPACE_PREFIX", "jcode-")
+    monkeypatch.setattr(generator, "get_workspace_archive_root", lambda: tmp_path / "archive")
+
+    with pytest.raises(generator.HTTPException) as error:
+        generator.move_assignment_between_workspace_and_final_archive(
+            "jcode-os-1",
+            "assignment-7",
+            90,
+            restore=True,
+        )
+
+    assert error.value.status_code == 409
+
+
+def test_finalization_copies_an_immutable_generation_without_moving_student_work(generator, monkeypatch, tmp_path):
+    student = tmp_path / "workspace" / "os-1-20260001"
+    assignment = student / "assignment-7"
+    assignment.mkdir(parents=True)
+    (assignment / "answer.py").write_text("first", encoding="utf-8")
+    monkeypatch.setattr(generator, "NFS_MOUNT_PATH", str(tmp_path))
+    monkeypatch.setattr(generator, "COURSE_NAMESPACE_PREFIX", "jcode-")
+    monkeypatch.setattr(generator, "get_workspace_archive_root", lambda: tmp_path / "archive")
+
+    copied = generator.move_assignment_between_workspace_and_final_archive(
+        "jcode-os-1", "assignment-7", 90, restore=False, finalization_generation=2
+    )
+
+    final = tmp_path / "archive" / "final" / "os-1" / "assignment-7" / "2" / student.name
+    assert copied == 1
+    assert (assignment / "answer.py").read_text(encoding="utf-8") == "first"
+    assert (final / "answer.py").read_text(encoding="utf-8") == "first"
+    assert json.loads((final / ".retention.json").read_text())["finalization_generation"] == 2

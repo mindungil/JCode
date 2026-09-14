@@ -8,13 +8,16 @@ import shlex
 import stat
 import shutil
 import tempfile
+import threading
 import time
+import uuid
 import zipfile
 import logging
 import requests
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, status, Request, Form, File, UploadFile
+from typing import Callable, Optional
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Form, File, UploadFile, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -41,6 +44,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+WORKSPACE_CONTRACT_VERSION = "3"
 
 app = FastAPI()
 
@@ -89,12 +93,11 @@ WORKSPACE_SETTINGS = {
     "chat.disableAIFeatures": True,
     "chat.commandCenter.enabled": False,
     "workbench.settings.showAISearchToggle": False,
-    "extensions.autoCheckUpdates": False,
-    "extensions.autoUpdate": False,
     "telemetry.telemetryLevel": "off",
 }
 CODE_SERVER_POLICY = {
-    "AllowedExtensions": {"*": False},
+    # Actual AI installation enforcement is in the pinned code-server image.
+    "AllowedExtensions": {"*": True},
     "ChatAgentMode": False,
     "ChatAgentExtensionTools": False,
     "ChatPluginsEnabled": False,
@@ -119,6 +122,8 @@ EXTERNAL_SECRET_REFRESH_INTERVAL = os.getenv("EXTERNAL_SECRET_REFRESH_INTERVAL",
 IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS = int(os.getenv("IMAGE_PULL_SECRET_READY_TIMEOUT_SECONDS", "60"))
 NAMESPACE_DELETE_TIMEOUT_SECONDS = int(os.getenv("NAMESPACE_DELETE_TIMEOUT_SECONDS", "60"))
 NAMESPACE_DELETE_POLL_SECONDS = float(os.getenv("NAMESPACE_DELETE_POLL_SECONDS", "2"))
+JCODE_DELETE_TIMEOUT_SECONDS = int(os.getenv("JCODE_DELETE_TIMEOUT_SECONDS", "60"))
+JCODE_DELETE_POLL_SECONDS = float(os.getenv("JCODE_DELETE_POLL_SECONDS", "1"))
 
 
 def get_workspace_node_selector() -> Optional[dict[str, str]]:
@@ -190,6 +195,10 @@ class DeployRequest(BaseModel):
     prac_count: int = Field(default=0, ge=0, le=10)
     assignment_dirs: list[str] = Field(default=[])
     assignment_labels: dict[str, str] = Field(default={})
+    policy_revision: int = Field(default=0, ge=0)
+    mount_hash: str = Field(default="", pattern=r"^[0-9a-f]{64}$")
+    session_kind: str = Field(default="STANDARD", pattern=r"^(STANDARD|SNAPSHOT|INSPECTOR)$")
+    read_only_workspace: bool = False
 
 class DeleteRequest(BaseModel):
     course_id: int = Field(gt=0)
@@ -247,6 +256,7 @@ class AssignmentArchiveRequest(BaseModel):
     workspace_key: str
     display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     retention_days: int = Field(default=90, ge=1, le=3650)
+    finalization_generation: int = Field(default=1, ge=1)
     starter_artifact_key: Optional[str] = None
     starter_checksum: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     starter_overwrite_policy: str = "PRESERVE_EXISTING"
@@ -485,10 +495,35 @@ def validate_workspace_profile(
         raise HTTPException(status_code=400, detail="workspace_scope가 올바르지 않습니다.")
     if environment_profile == "ALGORITHM" and (use_vnc or use_jupyter or base_image or resource_profile != "STANDARD"):
         raise HTTPException(status_code=409, detail="ALGORITHM 환경 설정이 표준 프로필과 일치하지 않습니다.")
-    if environment_profile == "LAB" and (not use_vnc or not use_jupyter or base_image or resource_profile != "STANDARD"):
+    # Accept the old LAB Jupyter flag during rolling upgrades; the maintained
+    # LAB image only provides IDE + VNC and normalizes it at deployment time.
+    if environment_profile == "LAB" and (not use_vnc or base_image or resource_profile != "STANDARD"):
         raise HTTPException(status_code=409, detail="LAB 환경 설정이 표준 프로필과 일치하지 않습니다.")
     if environment_profile == "CUSTOM":
         get_requested_workspace_image(use_vnc, environment_profile, base_image)
+
+
+def validate_deploy_session(request: DeployRequest) -> None:
+    if request.use_snapshot:
+        if request.session_kind not in {"STANDARD", "SNAPSHOT"} or request.assignment_workspace_key is not None:
+            raise HTTPException(status_code=409, detail="SNAPSHOT 세션 계약이 올바르지 않습니다.")
+        # Rolling compatibility: the previous Backend omitted session_kind.
+        request.session_kind = "SNAPSHOT"
+        return
+    if request.session_kind == "SNAPSHOT":
+        raise HTTPException(status_code=409, detail="SNAPSHOT 세션은 Snapshot workload여야 합니다.")
+    if request.session_kind == "INSPECTOR":
+        if (
+            request.workspace_scope != "ASSIGNMENT"
+            or request.assignment_workspace_key is None
+            or not request.read_only_workspace
+        ):
+            raise HTTPException(status_code=409, detail="INSPECTOR 세션은 과제 단위 읽기 전용이어야 합니다.")
+        return
+    if request.read_only_workspace:
+        raise HTTPException(status_code=409, detail="STANDARD 세션은 읽기 전용 검사 모드를 사용할 수 없습니다.")
+    if (request.workspace_scope == "ASSIGNMENT") != (request.assignment_workspace_key is not None):
+        raise HTTPException(status_code=409, detail="과제 단위 세션 식별자가 Workspace 범위와 일치하지 않습니다.")
 
 
 def get_workspace_resources(profile: str) -> client.V1ResourceRequirements:
@@ -614,6 +649,274 @@ def iter_course_student_dirs(namespace: str) -> list[Path]:
     )
 
 
+def read_workspace_identity(student_dir: Path) -> Optional[str]:
+    identity = student_dir / ".jcode" / "workspace-id"
+    if not identity.is_file() or identity.is_symlink():
+        return None
+    try:
+        value = identity.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return value if re.fullmatch(r"[0-9a-f]{32}", value) else None
+
+
+def ensure_workspace_identity(student_dir: Path) -> str:
+    existing = read_workspace_identity(student_dir)
+    if existing is not None:
+        return existing
+    metadata_dir = student_dir / ".jcode"
+    identity = metadata_dir / "workspace-id"
+    reject_symlink_path(student_dir, metadata_dir)
+    reject_symlink_path(student_dir, identity)
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    os.chown(metadata_dir, 1000, 1000)
+    value = uuid.uuid4().hex
+    try:
+        descriptor = os.open(identity, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o440)
+    except FileExistsError:
+        current = read_workspace_identity(student_dir)
+        if current is None:
+            raise HTTPException(status_code=409, detail="Workspace 식별자를 읽을 수 없습니다.")
+        return current
+    try:
+        os.write(descriptor, f"{value}\n".encode("ascii"))
+    finally:
+        os.close(descriptor)
+    os.chown(identity, 1000, 1000)
+    return value
+
+
+def operation_fingerprint(operation_name: str, request: BaseModel) -> str:
+    request_data = request.model_dump(mode="json")
+    # These values can legitimately converge while a multi-batch operation is running;
+    # they do not change the NFS mutation represented by the operation key.
+    for field in ("display_name", "deployments", "services"):
+        request_data.pop(field, None)
+    canonical = json.dumps(
+        {"operation": operation_name, "request": request_data},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def write_operation_state(path: Path, state: dict) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False
+    ) as temporary:
+        json.dump(state, temporary, ensure_ascii=False, sort_keys=True)
+        temporary_path = Path(temporary.name)
+    try:
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def read_lock_owner(lock: Path) -> Optional[str]:
+    try:
+        value = (lock / "owner").read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return value if re.fullmatch(r"[0-9a-f]{32}", value) else None
+
+
+def try_acquire_directory_lock(lock: Path, stale_seconds: int) -> Optional[str]:
+    owner = uuid.uuid4().hex
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        try:
+            if time.time() - lock.stat().st_mtime <= stale_seconds:
+                return None
+        except FileNotFoundError:
+            return None
+
+        # Serialize stale-lease replacement across Generator replicas. The lock is
+        # rechecked after acquiring this mutex to close the stat()/mkdir() race.
+        recovery = lock.with_name(f".{lock.name}.recovery")
+        try:
+            recovery.mkdir()
+        except FileExistsError:
+            try:
+                if time.time() - recovery.stat().st_mtime <= stale_seconds:
+                    return None
+                recovery.rmdir()
+                recovery.mkdir()
+            except (FileNotFoundError, FileExistsError, OSError):
+                return None
+        try:
+            try:
+                if time.time() - lock.stat().st_mtime <= stale_seconds:
+                    return None
+            except FileNotFoundError:
+                return None
+            retired = lock.with_name(f".{lock.name}.stale-{uuid.uuid4().hex}")
+            try:
+                os.rename(lock, retired)
+                lock.mkdir()
+            except (FileNotFoundError, FileExistsError, OSError):
+                return None
+            finally:
+                if retired.exists():
+                    shutil.rmtree(retired, ignore_errors=True)
+        finally:
+            try:
+                recovery.rmdir()
+            except OSError:
+                pass
+    try:
+        (lock / "owner").write_text(f"{owner}\n", encoding="ascii")
+    except Exception:
+        shutil.rmtree(lock, ignore_errors=True)
+        raise
+    return owner
+
+
+@contextmanager
+def keep_directory_lock_alive(lock: Path, stale_seconds: int, owner: str):
+    stop = threading.Event()
+
+    def heartbeat() -> None:
+        interval = max(1.0, min(30.0, stale_seconds / 3))
+        while not stop.wait(interval):
+            try:
+                if read_lock_owner(lock) != owner:
+                    return
+                os.utime(lock, None)
+            except FileNotFoundError:
+                return
+            except OSError:
+                logger.warning("Workspace 잠금 heartbeat 갱신 실패: %s", lock, exc_info=True)
+
+    worker = threading.Thread(
+        target=heartbeat,
+        name="workspace-lock-heartbeat",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join(timeout=2)
+        if read_lock_owner(lock) == owner:
+            shutil.rmtree(lock, ignore_errors=True)
+
+
+@contextmanager
+def student_workspace_lock(student_key: str):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,160}", student_key):
+        raise HTTPException(status_code=400, detail="학생 Workspace 식별자가 올바르지 않습니다.")
+    lock_root = Path(NFS_MOUNT_PATH) / ".jcode-student-locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock = lock_root / f"{hashlib.sha256(student_key.encode('utf-8')).hexdigest()}.lock"
+    stale_seconds = int(os.getenv("WORKSPACE_STUDENT_LOCK_STALE_SECONDS", "300"))
+    owner = try_acquire_directory_lock(lock, stale_seconds)
+    if owner is None:
+        raise HTTPException(status_code=409, detail="학생 Workspace 작업이 이미 진행 중입니다.")
+    with keep_directory_lock_alive(lock, stale_seconds, owner):
+        yield
+
+
+def process_workspace_batch(
+    namespace: str,
+    operation_key: str,
+    operation_name: str,
+    fingerprint: str,
+    worker: Callable[[Path], dict[str, int]],
+    bounded: bool = True,
+) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{16,64}", operation_key):
+        raise HTTPException(status_code=400, detail="Idempotency-Key 형식이 올바르지 않습니다.")
+    state_root = Path(NFS_MOUNT_PATH) / ".jcode-operations"
+    state_root.mkdir(parents=True, exist_ok=True)
+    state_id = hashlib.sha256(operation_key.encode("utf-8")).hexdigest()
+    state_path = state_root / f"{state_id}.json"
+    lock_path = state_root / f"{state_id}.lock"
+    stale_seconds = int(os.getenv("WORKSPACE_OPERATION_LOCK_STALE_SECONDS", "300"))
+    owner = try_acquire_directory_lock(lock_path, stale_seconds)
+    if owner is None:
+        return {"completed": False, "in_progress": True}
+
+    with keep_directory_lock_alive(lock_path, stale_seconds, owner):
+        if state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise HTTPException(status_code=409, detail="작업 원장을 읽을 수 없습니다.") from error
+            if state.get("fingerprint") != fingerprint or state.get("operation") != operation_name:
+                raise HTTPException(status_code=409, detail="Idempotency-Key가 다른 요청에 재사용되었습니다.")
+        else:
+            state = {
+                "operation": operation_name,
+                "fingerprint": fingerprint,
+                "processed": {},
+                "totals": {},
+            }
+
+        students = iter_course_student_dirs(namespace)
+        stored_processed = state.get("processed") or {}
+        # Old ledgers stored only directory names. Re-run them once so a directory that
+        # was archived and recreated under the same name is never mistaken for the old one.
+        processed = stored_processed if isinstance(stored_processed, dict) else {}
+        totals = {key: int(value) for key, value in (state.get("totals") or {}).items()}
+        batch_size = (
+            max(1, int(os.getenv("WORKSPACE_OPERATION_BATCH_SIZE", "25")))
+            if bounded else max(1, len(students))
+        )
+        batch_seconds = (
+            max(1.0, float(os.getenv("WORKSPACE_OPERATION_BATCH_SECONDS", "20")))
+            if bounded else float("inf")
+        )
+        deadline = time.monotonic() + batch_seconds
+        handled = 0
+        for student_dir in students:
+            if handled >= batch_size or time.monotonic() >= deadline:
+                break
+            with student_workspace_lock(student_dir.name):
+                # Membership archival can move this directory after the batch took
+                # its snapshot. Revalidate under the shared student lock so a stale
+                # Path never recreates a withdrawn user's workspace metadata.
+                if not student_dir.is_dir() or student_dir.is_symlink():
+                    continue
+                identity = ensure_workspace_identity(student_dir)
+                if processed.get(student_dir.name) == identity:
+                    continue
+                delta = worker(student_dir)
+            for key, value in delta.items():
+                totals[key] = totals.get(key, 0) + int(value)
+            processed[student_dir.name] = identity
+            handled += 1
+            state.update(
+                processed=dict(sorted(processed.items())),
+                totals=totals,
+                updatedAt=int(time.time()),
+            )
+            write_operation_state(state_path, state)
+
+        current_processed = set()
+        for student in students:
+            identity = read_workspace_identity(student)
+            if identity is not None and processed.get(student.name) == identity:
+                current_processed.add(student.name)
+        completed = len(current_processed) == len(students)
+        state.update(
+            processed=dict(sorted(processed.items())),
+            totals=totals,
+            completed=completed,
+            updatedAt=int(time.time()),
+        )
+        write_operation_state(state_path, state)
+        return {
+            "completed": completed,
+            "processed": len(current_processed),
+            "processed_students": sorted(current_processed),
+            "total": len(students),
+            **totals,
+        }
+
+
 def reject_symlink_path(root: Path, candidate: Path) -> None:
     root = root.resolve()
     current = candidate
@@ -724,7 +1027,7 @@ def read_assignment_workspace_entries(student_dir: Path) -> list[dict[str, str]]
             label = validate_workspace_display_name(folders[0]["name"], 50)
         except (OSError, json.JSONDecodeError, IndexError, KeyError, TypeError, HTTPException):
             continue
-        entries.append({"name": label, "path": f"../{workspace_key}"})
+        entries.append({"name": label, "path": f"../assignments/{workspace_key}"})
     return entries
 
 
@@ -792,18 +1095,21 @@ def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str,
     label = validate_workspace_display_name(display_name, 50)
     settings = {"settings": WORKSPACE_SETTINGS}
     write_workspace_json(student_dir, f"{workspace_key}.code-workspace", {
-        "folders": [{"name": label, "path": f"../{workspace_key}"}],
+        "folders": [{"name": label, "path": f"../assignments/{workspace_key}"}],
         **settings,
     })
     named_dir = student_dir / ".jcode" / "assignments" / workspace_key
     named_filename = assignment_workspace_filename(label)
-    write_workspace_json(student_dir, f"assignments/{workspace_key}/{named_filename}", {
-        "folders": [{"name": label, "path": f"../../../{workspace_key}"}],
+    named_payload = {
+        "folders": [{"name": label, "path": f"../../../assignments/{workspace_key}"}],
         **settings,
-    })
+    }
+    write_workspace_json(student_dir, f"assignments/{workspace_key}/{named_filename}", named_payload)
+    # Open editors retain their workspace URI. Update old aliases instead of deleting
+    # them on a rename; archive/removal still deletes every alias for this assignment.
     for stale in named_dir.glob("*.code-workspace"):
         if stale.name != named_filename and not stale.is_symlink():
-            stale.unlink(missing_ok=True)
+            write_workspace_json(student_dir, f"assignments/{workspace_key}/{stale.name}", named_payload)
     write_general_workspace_descriptor(student_dir)
 
 
@@ -843,22 +1149,122 @@ def copy_tree_preserving_existing(source: Path, target: Path) -> None:
             shutil.copy2(item, destination)
 
 
-def apply_starter_artifact(artifact: Path, target: Path, overwrite_policy: str) -> None:
+def system_mutation_marker(target: Path) -> Path:
+    return (
+        target.parent.parent
+        / ".jcode-system-mutations"
+        / target.parent.name
+        / f"{target.name}.json"
+    )
+
+
+def write_system_mutation_marker(
+    target: Path,
+    state: str,
+    artifact_checksum: str,
+    operation_key: Optional[str] = None,
+) -> None:
+    marker = system_mutation_marker(target)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "state": state,
+        "workspaceKey": target.name,
+        "artifactChecksum": artifact_checksum,
+        "operationKey": operation_key,
+        "updatedAtNs": time.time_ns(),
+    }
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=marker.parent,
+        suffix=".tmp",
+        delete=False,
+    ) as temporary:
+        json.dump(payload, temporary, ensure_ascii=False)
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, marker)
+    os.chown(marker, 1000, 1000)
+
+
+def chown_tree(target: Path) -> None:
+    for current, directories, files in os.walk(target):
+        os.chown(current, 1000, 1000, follow_symlinks=False)
+        for name in directories + files:
+            os.chown(os.path.join(current, name), 1000, 1000, follow_symlinks=False)
+
+
+def apply_starter_artifact(
+    artifact: Path,
+    target: Path,
+    overwrite_policy: str,
+    operation_key: Optional[str] = None,
+) -> bool:
     if overwrite_policy not in {"PRESERVE_EXISTING", "REPLACE_ALL"}:
         raise HTTPException(status_code=400, detail="overwrite_policy가 올바르지 않습니다.")
     reject_symlink_path(target.parent, target)
-    with tempfile.TemporaryDirectory() as temp_dir:
-        extracted = Path(temp_dir)
-        with zipfile.ZipFile(artifact, "r") as archive:
-            safe_extract_zip(archive, str(extracted))
-        if overwrite_policy == "REPLACE_ALL" and target.exists():
-            shutil.rmtree(target)
-        target.mkdir(parents=True, exist_ok=True)
-        copy_tree_preserving_existing(extracted, target)
-    for current, directories, files in os.walk(target):
-        os.chown(current, 1000, 1000)
-        for name in directories + files:
-            os.chown(os.path.join(current, name), 1000, 1000)
+    artifact_checksum = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    marker = system_mutation_marker(target)
+    if operation_key and marker.is_file():
+        try:
+            previous = json.loads(marker.read_text(encoding="utf-8"))
+            if (
+                previous.get("state") == "completed"
+                and previous.get("artifactChecksum") == artifact_checksum
+                and previous.get("operationKey") == operation_key
+            ):
+                return False
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    lock = marker.with_suffix(".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    stale_seconds = int(os.getenv("SYSTEM_MUTATION_LOCK_STALE_SECONDS", "900"))
+    lock_owner = try_acquire_directory_lock(lock, stale_seconds)
+    if lock_owner is None:
+        raise HTTPException(status_code=409, detail=f"과제 파일 작업이 이미 진행 중입니다: {target.name}")
+
+    with keep_directory_lock_alive(lock, stale_seconds, lock_owner):
+        completed = False
+        write_system_mutation_marker(target, "in_progress", artifact_checksum, operation_key)
+        try:
+            with tempfile.TemporaryDirectory(dir=target.parent, prefix=f".{target.name}.starter-") as temp_dir:
+                extracted = Path(temp_dir)
+                with zipfile.ZipFile(artifact, "r") as archive:
+                    safe_extract_zip(archive, str(extracted))
+                if overwrite_policy == "REPLACE_ALL":
+                    staged = target.parent / f".{target.name}.next"
+                    backup = target.parent / f".{target.name}.previous"
+                    if staged.exists():
+                        shutil.rmtree(staged)
+                    if backup.exists():
+                        if target.exists():
+                            shutil.rmtree(backup)
+                        else:
+                            os.replace(backup, target)
+                    shutil.copytree(extracted, staged)
+                    chown_tree(staged)
+                    if target.exists():
+                        os.replace(target, backup)
+                    try:
+                        os.replace(staged, target)
+                    except Exception:
+                        if backup.exists() and not target.exists():
+                            os.replace(backup, target)
+                        raise
+                    if backup.exists():
+                        shutil.rmtree(backup)
+                else:
+                    target.mkdir(parents=True, exist_ok=True)
+                    copy_tree_preserving_existing(extracted, target)
+                    chown_tree(target)
+            completed = True
+        finally:
+            write_system_mutation_marker(
+                target,
+                "completed" if completed else "failed",
+                artifact_checksum,
+                operation_key,
+            )
+    return True
 
 
 def move_directory_safely(source: Path, destination: Path, marker: Optional[dict] = None) -> None:
@@ -893,6 +1299,30 @@ def move_directory_safely(source: Path, destination: Path, marker: Optional[dict
         (destination / ".retention.json").write_text(
             json.dumps(marker, ensure_ascii=False), encoding="utf-8"
         )
+
+
+def copy_directory_immutable(source: Path, destination: Path, marker: dict) -> bool:
+    """Create one immutable finalization generation while leaving the live workspace untouched."""
+    if source.is_symlink() or destination.is_symlink():
+        raise HTTPException(status_code=409, detail="최종본 경로에 symlink를 사용할 수 없습니다.")
+    if not source.is_dir():
+        raise HTTPException(status_code=404, detail=f"복사할 경로가 없습니다: {source.name}")
+    if destination.exists():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.partial")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    try:
+        shutil.copytree(source, temporary, symlinks=True)
+        (temporary / ".retention.json").write_text(
+            json.dumps(marker, ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return True
 
 
 def get_smoke_workspace_paths(file_path: str, student_num: str) -> tuple[Path, Path]:
@@ -1069,6 +1499,20 @@ def health_ready():
     return {"status": "READY", "controller": CONTROLLER_MODE}
 
 
+@app.get("/health/contract", include_in_schema=False)
+def health_contract():
+    return {
+        "workspaceContractVersion": WORKSPACE_CONTRACT_VERSION,
+        "routeVersion": "3",
+        "features": [
+            "selective-assignment-mounts",
+            "inspector-read-only",
+            "deployment-observed-readiness",
+            "durable-batched-workspace-operations",
+        ],
+    }
+
+
 def require_service_scope(required_scope: str, required_controller: str):
     """Validate a short-lived Backend service JWT and its operation scope."""
     def verify_service_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -1198,15 +1642,18 @@ def create_deployment(
     environment_profile: str = "ALGORITHM", use_jupyter: bool = False,
     base_image: Optional[str] = None, resource_profile: str = "STANDARD",
     workspace_scope: str = "COURSE", assignment_workspace_key: Optional[str] = None,
+    policy_revision: int = 0, mount_hash: str = "",
+    session_kind: str = "STANDARD", read_only_workspace: bool = False,
 ) -> str:
     init_volume_mounts = []
+    isolated_extensions = use_snapshot or session_kind == "INSPECTOR"
 
     volume_mounts=[
         client.V1VolumeMount(
-            name="jcode-vol",
+            name="isolated-extensions" if isolated_extensions else "jcode-vol",
             mount_path="/home/coder/extensions",
-            sub_path=get_workspace_extension_subpath(student_num),
-            read_only=True,
+            sub_path=None if isolated_extensions else get_workspace_extension_subpath(student_num),
+            read_only=isolated_extensions,
         ),
         client.V1VolumeMount(
             name="config-vol",
@@ -1239,6 +1686,15 @@ def create_deployment(
         )
     ]
     volume_mounts.append(client.V1VolumeMount(name="tmp-vol", mount_path="/tmp"))
+    if isolated_extensions:
+        # Never execute a student's mutable extension code in an inspector session.
+        volumes.append(client.V1Volume(
+            name="isolated-extensions",
+            config_map=client.V1ConfigMapVolumeSource(
+                name="code-server-config",
+                items=[client.V1KeyToPath(key="extensions.json", path="extensions.json")],
+            ),
+        ))
 
     # 기본 containerPort 리스트
     container_ports = [
@@ -1264,6 +1720,7 @@ def create_deployment(
             sub_path=file_path,
             read_only=True
         )
+        volume_mounts.append(volume_mount)
         volumes.append (
             client.V1Volume(
                 name="snapshot-volume",
@@ -1281,38 +1738,42 @@ def create_deployment(
             file_path = f"{file_path.rstrip('/')}/{workspace_key}"
         if workspace_scope == "ASSIGNMENT":
             workspace_cmd = "true"
+            volume_mount = client.V1VolumeMount(
+                name="jcode-vol",
+                mount_path="/home/coder/project",
+                sub_path=file_path,
+                read_only=read_only_workspace,
+            )
+            init_volume_mounts.append(volume_mount)
+            volume_mounts.append(volume_mount)
         else:
-            safe_dirs = ["workspace", *[validate_workspace_dir_name(d) for d in (assignment_dirs or [])]]
-            dirs = " ".join(shlex.quote(f"/home/coder/project/{d}") for d in safe_dirs)
-            workspace_cmd = f"mkdir -p {dirs}"
-        base_cmd = f"\
-            chown -R 1000:1000 /home/coder/project && \
-            {workspace_cmd} && \
-            chown -R 1000:1000 /home/coder/project"
-        volume_mount=client.V1VolumeMount(
-            name="jcode-vol",
-            mount_path="/home/coder/project",
-            sub_path=file_path
-        )
-        init_volume_mounts.append(volume_mount)
-
-        if use_vnc:
-            hook_volume_mount=client.V1VolumeMount(
-                name="hook-vol",
-                mount_path="/home/coder/.ipython/profile_default/startup/99-hook.py",
-                sub_path="99-watcher-hook.py"
+            workspace_cmd = "true"
+            personal_mount = client.V1VolumeMount(
+                name="jcode-vol",
+                mount_path="/home/coder/project/workspace",
+                sub_path=f"{file_path.rstrip('/')}/workspace",
             )
-            hook_volume=client.V1Volume(
-                name="hook-vol",
-                config_map=client.V1ConfigMapVolumeSource(name="watcher-hook-config")
+            metadata_mount = client.V1VolumeMount(
+                name="jcode-vol",
+                mount_path="/home/coder/project/.jcode",
+                sub_path=f"{file_path.rstrip('/')}/.jcode",
+                read_only=True,
             )
-
-            volume_mounts.append(hook_volume_mount)
-            volumes.append(hook_volume)
+            assignment_mounts = [
+                client.V1VolumeMount(
+                    name="jcode-vol",
+                    mount_path=f"/home/coder/project/assignments/{workspace_key}",
+                    sub_path=f"{file_path.rstrip('/')}/{workspace_key}",
+                )
+                for workspace_key in [
+                    validate_assignment_workspace_key(value) for value in (assignment_dirs or [])
+                ]
+            ]
+            init_volume_mounts.extend([personal_mount, *assignment_mounts])
+            volume_mounts.extend([personal_mount, metadata_mount, *assignment_mounts])
+        base_cmd = workspace_cmd
 
     init_command = ["sh", "-c", base_cmd]
-    volume_mounts.append(volume_mount)
-
     # VNC를 사용할 경우 추가 설정
     if use_vnc:
         container_ports.append(client.V1ContainerPort(container_port=5901))  # VNC 포트 추가
@@ -1328,23 +1789,45 @@ def create_deployment(
         client.V1EnvVar(name="DOCKER_USER", value="ubuntu"),
         client.V1EnvVar(name="AUTH", value="none"),
         client.V1EnvVar(name="DISPLAY", value=":1"),  # VNC Display 설정
-        client.V1EnvVar(name="JUPYTER_ENABLED", value=str(use_jupyter).lower()),
-        client.V1EnvVar(name="EXTENSIONS_GALLERY", value="{}"),
+        client.V1EnvVar(name="JUPYTER_ENABLED", value=str(use_jupyter and environment_profile == "CUSTOM").lower()),
+        client.V1EnvVar(name="EXTENSIONS_GALLERY", value=json.dumps({} if isolated_extensions else {
+            "serviceUrl": "https://open-vsx.org/vscode/gallery",
+            "itemUrl": "https://open-vsx.org/vscode/item",
+            "extensionUrlTemplate": "https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
+            "resourceUrlTemplate": "https://open-vsx.org/vscode/asset/{publisher}/{name}/{version}/Microsoft.VisualStudio.Code.WebResources/{path}",
+        })),
     ] + get_code_server_extra_env(use_vnc) + get_workspace_proxy_env()
 
     deployment = client.V1Deployment(
         api_version="apps/v1",
         kind="Deployment",
-        metadata=client.V1ObjectMeta(name=deployment_name, namespace=namespace, labels={"app": app_label}),
+        metadata=client.V1ObjectMeta(
+            name=deployment_name,
+            namespace=namespace,
+            labels={"app": app_label},
+            annotations={
+                "jcode.io/policy-revision": str(policy_revision),
+                "jcode.io/mount-hash": mount_hash,
+            },
+        ),
         spec=client.V1DeploymentSpec(
             replicas=1,
             progress_deadline_seconds=600,
+            strategy=client.V1DeploymentStrategy(type="Recreate"),
             selector=client.V1LabelSelector(match_labels={"app": app_label}),
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
-                    labels={"app": app_label, "jcode/component": "workspace"}
+                    labels={
+                        "app": app_label,
+                        "jcode/component": "workspace",
+                        "jcode/session-kind": session_kind.lower(),
+                    },
+                    annotations={
+                        "jcode.io/mount-hash": mount_hash,
+                    },
                 ),
                 spec=client.V1PodSpec(
+                    hostname=deployment_name,
                     service_account_name=SERVICE_ACCOUNT,
                     automount_service_account_token=False,
                     dns_config=get_pod_dns_config(),
@@ -1399,7 +1882,12 @@ def create_deployment(
         return f"Deployment '{deployment_name}' 생성 완료"
     except ApiException as e:
         if e.status == 409:
-            apps_v1_api.patch_namespaced_deployment(
+            existing = apps_v1_api.read_namespaced_deployment(
+                name=deployment_name,
+                namespace=namespace,
+            )
+            deployment.metadata.resource_version = existing.metadata.resource_version
+            apps_v1_api.replace_namespaced_deployment(
                 name=deployment_name,
                 namespace=namespace,
                 body=deployment,
@@ -1470,7 +1958,7 @@ def delete_deployment(apps_v1_api, namespace: str, deployment_name: str) -> str:
         apps_v1_api.delete_namespaced_deployment(
             name = deployment_name,
             namespace = namespace,
-            body = client.V1DeleteOptions()
+            body = client.V1DeleteOptions(propagation_policy="Foreground")
         )
         logger.info(f"Deployment '{deployment_name}' 삭제 완료")
         return f"Deployment '{deployment_name}' 삭제 완료"
@@ -1479,6 +1967,56 @@ def delete_deployment(apps_v1_api, namespace: str, deployment_name: str) -> str:
             return f"Deployment '{deployment_name}'는 이미 삭제되었습니다."
         logger.exception("Deployment 삭제 중 오류:")
         raise Exception(f"Deployment 삭제 중 오류: {str(e)}")
+
+
+def wait_for_jcode_deleted(
+    apps_v1_api,
+    core_v1_api,
+    namespace: str,
+    deployment_name: str,
+    timeout_seconds: int = JCODE_DELETE_TIMEOUT_SECONDS,
+) -> bool:
+    return wait_for_jcodes_deleted(
+        apps_v1_api,
+        core_v1_api,
+        namespace,
+        [deployment_name],
+        timeout_seconds,
+    )
+
+
+def wait_for_jcodes_deleted(
+    apps_v1_api,
+    core_v1_api,
+    namespace: str,
+    deployment_names: list[str],
+    timeout_seconds: int = JCODE_DELETE_TIMEOUT_SECONDS,
+) -> bool:
+    names = sorted(set(deployment_names))
+    if not names:
+        return True
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = []
+        for deployment_name in names:
+            deployment_gone = False
+            try:
+                apps_v1_api.read_namespaced_deployment(deployment_name, namespace)
+            except ApiException as error:
+                if error.status != 404:
+                    raise
+                deployment_gone = True
+            pods = core_v1_api.list_namespaced_pod(
+                namespace,
+                label_selector=f"app={deployment_name}",
+            ).items
+            if not deployment_gone or pods:
+                remaining.append(deployment_name)
+        if not remaining:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(JCODE_DELETE_POLL_SECONDS)
 
 
 def delete_service(core_v1_api, namespace: str, service_name: str) -> str:
@@ -1711,17 +2249,8 @@ def ensure_code_server_config(core_v1_api, namespace: str):
         {
             "config.yaml": "bind-addr: 127.0.0.1:8080\nauth: none\ncert: false\n",
             "policy.json": json.dumps(CODE_SERVER_POLICY, ensure_ascii=False, indent=2) + "\n",
+            "extensions.json": "[]\n",
         },
-    )
-
-
-def ensure_watcher_hook_config(core_v1_api, namespace: str):
-    hook_path = Path(os.getenv("WATCHER_HOOK_PATH", Path(__file__).with_name("watcher_hook.py")))
-    upsert_config_map(
-        core_v1_api,
-        namespace,
-        "watcher-hook-config",
-        {"99-watcher-hook.py": hook_path.read_text(encoding="utf-8")},
     )
 
 
@@ -1921,8 +2450,6 @@ def init_namespace(
     # 4. ConfigMap (code-server-config)
     ensure_code_server_config(core_v1_api, namespace)
     ensure_course_metadata(core_v1_api, namespace, course_id)
-    if use_vnc:
-        ensure_watcher_hook_config(core_v1_api, namespace)
 
     # 6. LimitRange
     lr_body = client.V1LimitRange(
@@ -1956,26 +2483,25 @@ def init_namespace(
             namespace=namespace
         ),
         spec=client.V1NetworkPolicySpec(
-            pod_selector=client.V1LabelSelector(),
+            pod_selector=client.V1LabelSelector(
+                match_labels={"jcode/component": "workspace"}
+            ),
             ingress=[
                 client.V1NetworkPolicyIngressRule(
                     _from=[
                         client.V1NetworkPolicyPeer(
                             namespace_selector=client.V1LabelSelector(
                                 match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
-                            )
+                            ),
+                            pod_selector=client.V1LabelSelector(
+                                match_labels={"app": "jcode-router"}
+                            ),
                         ),
-                        client.V1NetworkPolicyPeer(
-                            namespace_selector=client.V1LabelSelector(
-                                match_labels={"kubernetes.io/metadata.name": "monitoring"}
-                            )
-                        ),
-                        client.V1NetworkPolicyPeer(
-                            namespace_selector=client.V1LabelSelector(
-                                match_labels={"kubernetes.io/metadata.name": "ingress-nginx"}
-                            )
-                        ),
-                    ]
+                    ],
+                    ports=[
+                        client.V1NetworkPolicyPort(port=8080, protocol="TCP"),
+                        client.V1NetworkPolicyPort(port=6080, protocol="TCP"),
+                    ],
                 )
             ],
             policy_types=["Ingress"]
@@ -1986,12 +2512,45 @@ def init_namespace(
         logger.info(f"NetworkPolicy 'watcher-networkpolicy' 생성 완료")
     except ApiException as e:
         if e.status == 409:
-            logger.info(f"NetworkPolicy 'watcher-networkpolicy'가 이미 존재합니다.")
+            networking_v1_api.patch_namespaced_network_policy(
+                name="watcher-networkpolicy",
+                namespace=namespace,
+                body=np_body,
+            )
+            logger.info(f"NetworkPolicy 'watcher-networkpolicy' 갱신 완료")
         else:
             raise
 
-    # Workspace pods may reach DNS and the Watcher API only. In particular they
-    # cannot call the Generator service even though both live in the watcher NS.
+    default_deny_egress = client.V1NetworkPolicy(
+        metadata=client.V1ObjectMeta(
+            name="workspace-default-deny-egress",
+            namespace=namespace,
+        ),
+        spec=client.V1NetworkPolicySpec(
+            pod_selector=client.V1LabelSelector(
+                match_labels={"jcode/component": "workspace"}
+            ),
+            egress=[],
+            policy_types=["Egress"],
+        ),
+    )
+    try:
+        networking_v1_api.create_namespaced_network_policy(
+            namespace=namespace,
+            body=default_deny_egress,
+        )
+    except ApiException as e:
+        if e.status == 409:
+            networking_v1_api.patch_namespaced_network_policy(
+                name="workspace-default-deny-egress",
+                namespace=namespace,
+                body=default_deny_egress,
+            )
+        else:
+            raise
+
+    # Student workspaces can resolve DNS and use the controlled package proxy.
+    # Event collection is performed outside the untrusted student container.
     workspace_egress_rules = [
         client.V1NetworkPolicyEgressRule(
             to=build_workspace_dns_peers(),
@@ -1999,17 +2558,6 @@ def init_namespace(
                 client.V1NetworkPolicyPort(port=53, protocol="UDP"),
                 client.V1NetworkPolicyPort(port=53, protocol="TCP"),
             ],
-        ),
-        client.V1NetworkPolicyEgressRule(
-            to=[
-                client.V1NetworkPolicyPeer(
-                    namespace_selector=client.V1LabelSelector(
-                        match_labels={"kubernetes.io/metadata.name": WATCHER_NAMESPACE}
-                    ),
-                    pod_selector=client.V1LabelSelector(match_labels={"app": "watcher-backend"}),
-                )
-            ],
-            ports=[client.V1NetworkPolicyPort(port=3000, protocol="TCP")],
         ),
     ]
     if egress_policy == "PACKAGE_PROXY":
@@ -2035,7 +2583,10 @@ def init_namespace(
         ),
         spec=client.V1NetworkPolicySpec(
             pod_selector=client.V1LabelSelector(
-                match_labels={"jcode/component": "workspace"}
+                match_labels={
+                    "jcode/component": "workspace",
+                    "jcode/session-kind": "standard",
+                }
             ),
             egress=workspace_egress_rules,
             policy_types=["Egress"],
@@ -2055,6 +2606,68 @@ def init_namespace(
                 body=workspace_egress,
             )
             logger.info(f"NetworkPolicy 'workspace-egress' 갱신 완료")
+        else:
+            raise
+
+    inspector_egress = client.V1NetworkPolicy(
+        metadata=client.V1ObjectMeta(
+            name="inspector-deny-egress",
+            namespace=namespace,
+        ),
+        spec=client.V1NetworkPolicySpec(
+            pod_selector=client.V1LabelSelector(
+                match_labels={
+                    "jcode/component": "workspace",
+                    "jcode/session-kind": "inspector",
+                }
+            ),
+            egress=[],
+            policy_types=["Egress"],
+        ),
+    )
+    try:
+        networking_v1_api.create_namespaced_network_policy(
+            namespace=namespace,
+            body=inspector_egress,
+        )
+    except ApiException as e:
+        if e.status == 409:
+            networking_v1_api.patch_namespaced_network_policy(
+                name="inspector-deny-egress",
+                namespace=namespace,
+                body=inspector_egress,
+            )
+        else:
+            raise
+
+    snapshot_egress = client.V1NetworkPolicy(
+        metadata=client.V1ObjectMeta(
+            name="snapshot-deny-egress",
+            namespace=namespace,
+        ),
+        spec=client.V1NetworkPolicySpec(
+            pod_selector=client.V1LabelSelector(
+                match_labels={
+                    "jcode/component": "workspace",
+                    "jcode/session-kind": "snapshot",
+                }
+            ),
+            egress=[],
+            policy_types=["Egress"],
+        ),
+    )
+    try:
+        networking_v1_api.create_namespaced_network_policy(
+            namespace=namespace,
+            body=snapshot_egress,
+        )
+    except ApiException as e:
+        if e.status == 409:
+            networking_v1_api.patch_namespaced_network_policy(
+                name="snapshot-deny-egress",
+                namespace=namespace,
+                body=snapshot_egress,
+            )
         else:
             raise
 
@@ -2277,9 +2890,10 @@ async def deploy_resources(
     core_v1_api = client.CoreV1Api()
     apps_v1_api = client.AppsV1Api()
 
-    # Workspace Controller는 이미 bootstrap된 Namespace의 소유 메타데이터와
-    # 런타임 ConfigMap만 확인한다. Cluster-scoped 리소스는 만지지 않는다.
     try:
+        # Workspace Controller는 이미 bootstrap된 Namespace의 소유 메타데이터와
+        # 런타임 ConfigMap만 확인한다. Cluster-scoped 리소스는 만지지 않는다.
+        validate_deploy_session(request)
         validate_workspace_profile(
             request.environment_profile,
             request.use_vnc,
@@ -2290,70 +2904,81 @@ async def deploy_resources(
             request.workspace_scope,
         )
         verify_course_namespace(core_v1_api, namespace, request.course_id)
-        prepare_workspace_extension(request.student_num)
-        if not request.use_snapshot and request.workspace_scope == "COURSE":
-            workspace_keys = [validate_assignment_workspace_key(value) for value in request.assignment_dirs]
-            unknown_labels = set(request.assignment_labels) - set(workspace_keys)
-            if unknown_labels:
-                raise HTTPException(status_code=400, detail="assignment_labels에 알 수 없는 workspace_key가 있습니다.")
-            class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
-            workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
-            reject_symlink_path(workspace.parent, workspace)
-            workspace.mkdir(parents=True, exist_ok=True)
-            os.chown(workspace, 1000, 1000)
-            for workspace_key in workspace_keys:
-                assignment_path = workspace / workspace_key
-                reject_symlink_path(workspace, assignment_path)
-                assignment_path.mkdir(parents=True, exist_ok=True)
-                os.chown(assignment_path, 1000, 1000)
-                write_assignment_workspace_descriptor(
-                    workspace,
-                    workspace_key,
-                    request.assignment_labels.get(workspace_key),
-                )
-            remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
-            write_general_workspace_descriptor(workspace, request.workspace_display_name)
-        ensure_code_server_config(core_v1_api, namespace)
-        if request.use_vnc:
-            ensure_watcher_hook_config(core_v1_api, namespace)
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise
-        logger.exception("Workspace Namespace 검증·동기화 실패:")
-        raise HTTPException(status_code=500, detail=f"Namespace 검증 실패: {str(e)}")
-
-    try:
-        deployment_msg = create_deployment(
-            apps_v1_api,
-            namespace,
-            request.deployment_name,
-            request.app_label,
-            request.file_path,
-            request.student_num,
-            request.use_vnc,
-            request.use_snapshot,
-            request.hw_count,
-            request.prac_count,
-            request.assignment_dirs,
-            request.environment_profile,
-            request.use_jupyter,
-            request.base_image,
-            request.resource_profile,
-            request.workspace_scope,
-            request.assignment_workspace_key,
+        class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
+        expected_file_path = (
+            class_div
+            if request.use_snapshot
+            else f"workspace/{class_div}-{request.student_num}"
         )
-        service_msg = create_service(
-            core_v1_api,
-            namespace,
-            request.service_name,
-            request.app_label,
-            request.use_vnc
+        if request.file_path != expected_file_path:
+            raise HTTPException(status_code=409, detail="JCode Workspace 경로가 강의와 사용자 정보에 일치하지 않습니다.")
+
+        lock_context = (
+            nullcontext()
+            if request.use_snapshot
+            else student_workspace_lock(f"{class_div}-{request.student_num}")
         )
+        with lock_context:
+            prepare_workspace_extension(request.student_num)
+            if not request.use_snapshot and request.workspace_scope == "COURSE":
+                workspace_keys = [validate_assignment_workspace_key(value) for value in request.assignment_dirs]
+                unknown_labels = set(request.assignment_labels) - set(workspace_keys)
+                if unknown_labels:
+                    raise HTTPException(status_code=400, detail="assignment_labels에 알 수 없는 workspace_key가 있습니다.")
+                workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
+                reject_symlink_path(workspace.parent, workspace)
+                workspace.mkdir(parents=True, exist_ok=True)
+                os.chown(workspace, 1000, 1000)
+                ensure_workspace_identity(workspace)
+                for workspace_key in workspace_keys:
+                    assignment_path = workspace / workspace_key
+                    reject_symlink_path(workspace, assignment_path)
+                    assignment_path.mkdir(parents=True, exist_ok=True)
+                    os.chown(assignment_path, 1000, 1000)
+                    write_assignment_workspace_descriptor(
+                        workspace,
+                        workspace_key,
+                        request.assignment_labels.get(workspace_key),
+                    )
+                remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
+                write_general_workspace_descriptor(workspace, request.workspace_display_name)
+            ensure_code_server_config(core_v1_api, namespace)
 
-        jcodeUrl = f"http://{request.service_name}.{namespace}.svc.cluster.local:8080"
-        msg = f"{deployment_msg}; {service_msg}"
+            deployment_msg = create_deployment(
+                apps_v1_api,
+                namespace,
+                request.deployment_name,
+                request.app_label,
+                request.file_path,
+                request.student_num,
+                request.use_vnc,
+                request.use_snapshot,
+                request.hw_count,
+                request.prac_count,
+                request.assignment_dirs,
+                request.environment_profile,
+                request.use_jupyter,
+                request.base_image,
+                request.resource_profile,
+                request.workspace_scope,
+                request.assignment_workspace_key,
+                request.policy_revision,
+                request.mount_hash,
+                request.session_kind,
+                request.read_only_workspace,
+            )
+            service_msg = create_service(
+                core_v1_api,
+                namespace,
+                request.service_name,
+                request.app_label,
+                request.use_vnc
+            )
 
-        return {"jcodeUrl": jcodeUrl, "msg": msg}
+            jcode_url = f"http://{request.service_name}.{namespace}.svc.cluster.local:8080"
+            return {"jcodeUrl": jcode_url, "msg": f"{deployment_msg}; {service_msg}"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("리소스 배포 중 오류:")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2365,6 +2990,8 @@ async def get_jcode_status(
     namespace: str,
     deployment_name: str,
     service_name: str,
+    policy_revision: Optional[int] = None,
+    mount_hash: Optional[str] = None,
     token_payload: dict = Depends(require_service_scope("jcode:read", "workspace")),
 ):
     """Report readiness only after both the Deployment and Service endpoint are ready."""
@@ -2412,6 +3039,13 @@ async def get_jcode_status(
             return {"state": "MISSING", "reasonCode": "DEPLOYMENT_MISSING"}
         raise
 
+    deployment_annotations = deployment.metadata.annotations or {}
+    template_annotations = deployment.spec.template.metadata.annotations or {}
+    if policy_revision is not None and deployment_annotations.get("jcode.io/policy-revision") != str(policy_revision):
+        return {"state": "DRIFTED", "reasonCode": "POLICY_REVISION_MISMATCH"}
+    if mount_hash is not None and template_annotations.get("jcode.io/mount-hash") != mount_hash:
+        return {"state": "DRIFTED", "reasonCode": "MOUNT_HASH_MISMATCH"}
+
     conditions = deployment.status.conditions or []
     if any(
         condition.type == "Progressing"
@@ -2455,10 +3089,33 @@ async def get_jcode_status(
     if not endpoint_ready:
         return {"state": "NOT_READY", "reasonCode": "SERVICE_ENDPOINT_NOT_READY"}
 
+    if policy_revision is not None or mount_hash is not None:
+        pods = core_v1_api.list_namespaced_pod(
+            namespace,
+            label_selector=f"app={deployment_selector.get('app', '')}",
+        ).items
+        ready_pods = [
+            pod for pod in pods
+            if any(
+                condition.type == "Ready" and condition.status == "True"
+                for condition in (pod.status.conditions or [])
+            )
+        ]
+        if not ready_pods:
+            return {"state": "NOT_READY", "reasonCode": "POLICY_POD_NOT_READY"}
+        if any(
+            mount_hash is not None
+            and (pod.metadata.annotations or {}).get("jcode.io/mount-hash") != mount_hash
+            for pod in ready_pods
+        ):
+            return {"state": "DRIFTED", "reasonCode": "POLICY_POD_MISMATCH"}
+
     return {
         "state": "READY",
         "reasonCode": "READY",
         "jcodeUrl": f"http://{service_name}.{namespace}.svc.cluster.local:8080",
+        "policyRevision": policy_revision,
+        "mountHash": mount_hash,
     }
     
 @app.delete("/api/jcode")
@@ -2493,6 +3150,15 @@ async def delete_resources(
             namespace,
             request.service_name
         )
+        if not wait_for_jcode_deleted(
+            apps_v1_api,
+            core_v1_api,
+            namespace,
+            request.deployment_name,
+        ):
+            raise RuntimeError(
+                f"JCode Deployment/Pod 삭제 확인 시간이 초과되었습니다: {request.deployment_name}"
+            )
 
         msg = f"{deployment_msg}; {service_msg}"
         return {"msg": msg}
@@ -2537,18 +3203,19 @@ async def provision_workspace(
 @app.post("/api/workspace/assignments/provision")
 async def provision_assignment_workspace(
     request: AssignmentProvisionRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=64),
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+    batch_protocol: Optional[str] = Header(default=None, alias="X-Workspace-Batch-Protocol"),
 ):
     """불변 assignment key를 모든 기존 학생 공간에 멱등하게 준비합니다."""
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
     workspace_key = validate_assignment_workspace_key(request.workspace_key)
     legacy = validate_workspace_dir_name(request.legacy_dir_name) if request.legacy_dir_name else None
-    migrated = 0
-    created = 0
-    for student_dir in iter_course_student_dirs(namespace):
+    def provision(student_dir: Path) -> dict[str, int]:
         target = student_dir / workspace_key
         source = student_dir / legacy if legacy and legacy != workspace_key else None
+        result = {"migrated": 0, "created": 0}
         reject_symlink_path(student_dir, target)
         if source is not None:
             reject_symlink_path(student_dir, source)
@@ -2560,14 +3227,41 @@ async def provision_assignment_workspace(
                 )
         else:
             if source and source.exists():
-                source.rename(target)
-                migrated += 1
+                write_system_mutation_marker(
+                    target, "in_progress", "assignment-path-migration", idempotency_key
+                )
+                migration_completed = False
+                try:
+                    source.rename(target)
+                    migration_completed = True
+                finally:
+                    write_system_mutation_marker(
+                        target,
+                        "completed" if migration_completed else "failed",
+                        "assignment-path-migration",
+                        idempotency_key,
+                    )
+                result = {"migrated": 1, "created": 0}
             else:
                 target.mkdir(parents=True, exist_ok=True)
-                created += 1
+                result = {"migrated": 0, "created": 1}
         os.chown(target, 1000, 1000)
-        write_assignment_workspace_descriptor(student_dir, workspace_key, request.display_name)
-    return {"workspace_key": workspace_key, "migrated": migrated, "created": created}
+        descriptor = student_dir / ".jcode" / f"{workspace_key}.code-workspace"
+        if request.display_name and descriptor.is_file() and not descriptor.is_symlink():
+            write_assignment_workspace_descriptor(
+                student_dir, workspace_key, request.display_name
+            )
+        return result
+
+    result = process_workspace_batch(
+        namespace,
+        idempotency_key,
+        "provision-assignment",
+        operation_fingerprint("provision-assignment", request),
+        provision,
+        bounded=batch_protocol == "1",
+    )
+    return {"workspace_key": workspace_key, **result}
 
 
 @app.post("/api/workspace/assignments/starter/upload")
@@ -2616,7 +3310,9 @@ async def upload_starter_artifact(
 @app.post("/api/workspace/assignments/starter/distribute")
 async def distribute_starter_artifact(
     request: StarterDistributeRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=64),
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+    batch_protocol: Optional[str] = Header(default=None, alias="X-Workspace-Batch-Protocol"),
 ):
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
@@ -2627,17 +3323,32 @@ async def distribute_starter_artifact(
     if not artifact.is_file():
         raise HTTPException(status_code=404, detail="스타터 artifact를 찾을 수 없습니다.")
     verify_artifact_checksum(artifact, request.checksum)
-    deployed = 0
-    for student_dir in iter_course_student_dirs(namespace):
-        apply_starter_artifact(artifact, student_dir / workspace_key, request.overwrite_policy)
-        deployed += 1
-    return {"workspace_key": workspace_key, "deployed": deployed}
+    def distribute(student_dir: Path) -> dict[str, int]:
+        deployed = apply_starter_artifact(
+            artifact,
+            student_dir / workspace_key,
+            request.overwrite_policy,
+            idempotency_key,
+        )
+        return {"deployed": int(deployed)}
+
+    result = process_workspace_batch(
+        namespace,
+        idempotency_key,
+        "distribute-starter",
+        operation_fingerprint("distribute-starter", request),
+        distribute,
+        bounded=batch_protocol == "1",
+    )
+    return {"workspace_key": workspace_key, **result}
 
 
 @app.post("/api/workspace/assignments/archive")
 async def archive_assignment_workspace(
     request: AssignmentArchiveRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=64),
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+    batch_protocol: Optional[str] = Header(default=None, alias="X-Workspace-Batch-Protocol"),
 ):
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
@@ -2647,12 +3358,13 @@ async def archive_assignment_workspace(
         delete_deployment(apps_api, namespace, name)
     for name in request.services:
         delete_service(core_api, namespace, name)
+    if not wait_for_jcodes_deleted(apps_api, core_api, namespace, request.deployments):
+        raise HTTPException(status_code=503, detail="과제 JCode 종료 확인 시간이 초과되었습니다.")
     workspace_key = validate_assignment_workspace_key(request.workspace_key)
     archive_root = get_workspace_archive_root()
     archive_root.mkdir(parents=True, exist_ok=True)
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
-    archived = 0
-    for student_dir in iter_course_student_dirs(namespace):
+    def archive(student_dir: Path) -> dict[str, int]:
         source = student_dir / workspace_key
         final_source = resolve_below(
             archive_root, f"final/{class_div}/{student_dir.name}/{workspace_key}"
@@ -2662,22 +3374,47 @@ async def archive_assignment_workspace(
         destination = resolve_below(archive_root, f"{class_div}/{student_dir.name}/{workspace_key}")
         if not source.exists():
             remove_assignment_workspace_descriptor(student_dir, workspace_key)
-            continue
+            return {"archived": 0}
         if destination.exists():
             raise HTTPException(status_code=409, detail=f"보관 경로가 이미 존재합니다: {student_dir.name}")
-        move_directory_safely(
-            source,
-            destination,
-            {
-                "course_id": request.course_id,
-                "workspace_key": workspace_key,
-                "retention_days": request.retention_days,
-                "archived_at": int(time.time()),
-            },
+        write_system_mutation_marker(
+            student_dir / workspace_key,
+            "in_progress",
+            "assignment-archive",
+            idempotency_key,
         )
+        archive_completed = False
+        try:
+            move_directory_safely(
+                source,
+                destination,
+                {
+                    "course_id": request.course_id,
+                    "workspace_key": workspace_key,
+                    "retention_days": request.retention_days,
+                    "archived_at": int(time.time()),
+                },
+            )
+            archive_completed = True
+        finally:
+            write_system_mutation_marker(
+                student_dir / workspace_key,
+                "completed" if archive_completed else "failed",
+                "assignment-archive",
+                idempotency_key,
+            )
         remove_assignment_workspace_descriptor(student_dir, workspace_key)
-        archived += 1
-    return {"workspace_key": workspace_key, "archived": archived}
+        return {"archived": 1}
+
+    result = process_workspace_batch(
+        namespace,
+        idempotency_key,
+        "archive-assignment",
+        operation_fingerprint("archive-assignment", request),
+        archive,
+        bounded=batch_protocol == "1",
+    )
+    return {"workspace_key": workspace_key, **result}
 
 
 def move_assignment_between_workspace_and_final_archive(
@@ -2688,47 +3425,61 @@ def move_assignment_between_workspace_and_final_archive(
     starter_artifact: Optional[Path] = None,
     starter_overwrite_policy: str = "PRESERVE_EXISTING",
     display_name: Optional[str] = None,
+    finalization_generation: int = 1,
+    student_directories: Optional[list[Path]] = None,
 ) -> int:
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     archive_root = get_workspace_archive_root()
     moved = 0
-    for student_dir in iter_course_student_dirs(namespace):
+    for student_dir in student_directories or iter_course_student_dirs(namespace):
         workspace_path = student_dir / workspace_key
-        final_path = resolve_below(archive_root, f"final/{class_div}/{student_dir.name}/{workspace_key}")
-        source, destination = (final_path, workspace_path) if restore else (workspace_path, final_path)
+        legacy_final_path = resolve_below(archive_root, f"final/{class_div}/{student_dir.name}/{workspace_key}")
+        final_path = resolve_below(
+            archive_root,
+            f"final/{class_div}/{workspace_key}/{finalization_generation}/{student_dir.name}",
+        )
+        if restore:
+            source = final_path if final_path.exists() else legacy_final_path
+            destination = workspace_path
+        else:
+            source, destination = workspace_path, final_path
         if not source.exists():
             if destination.exists():
                 if restore:
-                    write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
-                else:
-                    remove_assignment_workspace_descriptor(student_dir, workspace_key)
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"최종본 없이 Workspace만 남아 있습니다: {student_dir.name}",
+                    )
+                remove_assignment_workspace_descriptor(student_dir, workspace_key)
                 continue
             if restore:
                 destination.mkdir(parents=True, exist_ok=True)
                 os.chown(destination, 1000, 1000)
                 if starter_artifact is not None:
                     apply_starter_artifact(starter_artifact, destination, starter_overwrite_policy)
-                write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
                 moved += 1
             continue
-        if destination.exists():
-            raise HTTPException(status_code=409, detail=f"원본과 대상 경로가 함께 존재합니다: {student_dir.name}")
         if restore:
-            move_directory_safely(source, destination)
+            if destination.exists():
+                continue
+            shutil.copytree(source, destination, symlinks=True)
             (destination / ".retention.json").unlink(missing_ok=True)
+            chown_tree(destination)
         else:
-            move_directory_safely(
+            copied = copy_directory_immutable(
                 source,
                 destination,
                 {
                     "workspace_key": workspace_key,
+                    "finalization_generation": finalization_generation,
                     "retention_days": retention_days,
                     "archived_at": int(time.time()),
                 },
             )
-        if restore:
-            write_assignment_workspace_descriptor(student_dir, workspace_key, display_name)
-        else:
+            if not copied:
+                remove_assignment_workspace_descriptor(student_dir, workspace_key)
+                continue
+        if not restore:
             remove_assignment_workspace_descriptor(student_dir, workspace_key)
         moved += 1
     return moved
@@ -2737,7 +3488,9 @@ def move_assignment_between_workspace_and_final_archive(
 @app.post("/api/workspace/assignments/finalize")
 async def finalize_assignment_workspace(
     request: AssignmentArchiveRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=64),
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+    batch_protocol: Optional[str] = Header(default=None, alias="X-Workspace-Batch-Protocol"),
 ):
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
@@ -2747,17 +3500,41 @@ async def finalize_assignment_workspace(
         delete_deployment(apps_api, namespace, name)
     for name in request.services:
         delete_service(core_api, namespace, name)
+    if not wait_for_jcodes_deleted(apps_api, core_api, namespace, request.deployments):
+        raise HTTPException(status_code=503, detail="과제 JCode 종료 확인 시간이 초과되었습니다.")
     workspace_key = validate_assignment_workspace_key(request.workspace_key)
-    moved = move_assignment_between_workspace_and_final_archive(
-        namespace, workspace_key, request.retention_days, restore=False
+    def finalize(student_dir: Path) -> dict[str, int]:
+        moved = move_assignment_between_workspace_and_final_archive(
+            namespace,
+            workspace_key,
+            request.retention_days,
+            restore=False,
+            finalization_generation=request.finalization_generation,
+            student_directories=[student_dir],
+        )
+        return {"moved": moved}
+
+    result = process_workspace_batch(
+        namespace,
+        idempotency_key,
+        "finalize-assignment",
+        operation_fingerprint("finalize-assignment", request),
+        finalize,
+        bounded=batch_protocol == "1",
     )
-    return {"finalized": True, "workspace_key": workspace_key, "moved": moved}
+    return {
+        "finalized": result["completed"],
+        "workspace_key": workspace_key,
+        **result,
+    }
 
 
 @app.post("/api/workspace/assignments/restore")
 async def restore_assignment_workspace(
     request: AssignmentArchiveRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=64),
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
+    batch_protocol: Optional[str] = Header(default=None, alias="X-Workspace-Batch-Protocol"),
 ):
     namespace = resolve_namespace(request.namespace)
     verify_course_namespace(client.CoreV1Api(), namespace, request.course_id)
@@ -2772,21 +3549,55 @@ async def restore_assignment_workspace(
         if not starter_artifact.is_file():
             raise HTTPException(status_code=404, detail="스타터 artifact를 찾을 수 없습니다.")
         verify_artifact_checksum(starter_artifact, request.starter_checksum)
-    moved = move_assignment_between_workspace_and_final_archive(
+    def restore(student_dir: Path) -> dict[str, int]:
+        write_system_mutation_marker(
+            student_dir / workspace_key,
+            "in_progress",
+            "assignment-restore",
+            idempotency_key,
+        )
+        restore_completed = False
+        try:
+            moved = move_assignment_between_workspace_and_final_archive(
+                namespace,
+                workspace_key,
+                request.retention_days,
+                restore=True,
+                starter_artifact=starter_artifact,
+                starter_overwrite_policy=request.starter_overwrite_policy,
+                display_name=request.display_name,
+                finalization_generation=request.finalization_generation,
+                student_directories=[student_dir],
+            )
+            restore_completed = True
+        finally:
+            write_system_mutation_marker(
+                student_dir / workspace_key,
+                "completed" if restore_completed else "failed",
+                "assignment-restore",
+                idempotency_key,
+            )
+        return {"moved": moved}
+
+    result = process_workspace_batch(
         namespace,
-        workspace_key,
-        request.retention_days,
-        restore=True,
-        starter_artifact=starter_artifact,
-        starter_overwrite_policy=request.starter_overwrite_policy,
-        display_name=request.display_name,
+        idempotency_key,
+        "restore-assignment",
+        operation_fingerprint("restore-assignment", request),
+        restore,
+        bounded=batch_protocol == "1",
     )
-    return {"restored": True, "workspace_key": workspace_key, "moved": moved}
+    return {
+        "restored": result["completed"],
+        "workspace_key": workspace_key,
+        **result,
+    }
 
 
 @app.post("/api/workspace/students/provision")
 async def provision_student_workspace(
     request: StudentProvisionRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=64),
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
 ):
     namespace = resolve_namespace(request.namespace)
@@ -2798,34 +3609,43 @@ async def provision_student_workspace(
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
     prepare_workspace_extension(request.student_num)
-    reject_symlink_path(workspace.parent, workspace)
-    workspace.mkdir(parents=True, exist_ok=True)
-    os.chown(workspace, 1000, 1000)
-    for workspace_key in workspace_keys:
-        assignment_path = workspace / workspace_key
-        reject_symlink_path(workspace, assignment_path)
-        assignment_path.mkdir(parents=True, exist_ok=True)
-        os.chown(assignment_path, 1000, 1000)
-        write_assignment_workspace_descriptor(workspace, workspace_key, request.workspace_labels.get(workspace_key))
-    remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
-    applied = 0
-    for artifact_ref in request.artifacts:
-        workspace_key = validate_assignment_workspace_key(artifact_ref.workspace_key)
-        if not re.fullmatch(r"assignments/[1-9][0-9]*/starter/v[1-9][0-9]*\.zip", artifact_ref.artifact_key):
-            raise HTTPException(status_code=400, detail="artifact_key 형식이 올바르지 않습니다.")
-        artifact = resolve_below(get_starter_artifact_root(), artifact_ref.artifact_key)
-        if not artifact.is_file():
-            raise HTTPException(status_code=404, detail=f"스타터 artifact를 찾을 수 없습니다: {artifact_ref.artifact_key}")
-        verify_artifact_checksum(artifact, artifact_ref.checksum)
-        apply_starter_artifact(artifact, workspace / workspace_key, artifact_ref.overwrite_policy)
-        applied += 1
-    write_general_workspace_descriptor(workspace, request.display_name)
+    with student_workspace_lock(workspace.name):
+        reject_symlink_path(workspace.parent, workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+        os.chown(workspace, 1000, 1000)
+        ensure_workspace_identity(workspace)
+        for workspace_key in workspace_keys:
+            assignment_path = workspace / workspace_key
+            reject_symlink_path(workspace, assignment_path)
+            assignment_path.mkdir(parents=True, exist_ok=True)
+            os.chown(assignment_path, 1000, 1000)
+        # Membership provisioning owns physical storage only. Visibility descriptors
+        # belong to the JCode policy reconciler; deleting them here can race a policy
+        # update for an already-running workspace.
+        applied = 0
+        for artifact_ref in request.artifacts:
+            workspace_key = validate_assignment_workspace_key(artifact_ref.workspace_key)
+            if not re.fullmatch(r"assignments/[1-9][0-9]*/starter/v[1-9][0-9]*\.zip", artifact_ref.artifact_key):
+                raise HTTPException(status_code=400, detail="artifact_key 형식이 올바르지 않습니다.")
+            artifact = resolve_below(get_starter_artifact_root(), artifact_ref.artifact_key)
+            if not artifact.is_file():
+                raise HTTPException(status_code=404, detail=f"스타터 artifact를 찾을 수 없습니다: {artifact_ref.artifact_key}")
+            verify_artifact_checksum(artifact, artifact_ref.checksum)
+            if apply_starter_artifact(
+                artifact,
+                workspace / workspace_key,
+                artifact_ref.overwrite_policy,
+                idempotency_key,
+            ):
+                applied += 1
+        write_general_workspace_descriptor(workspace, request.display_name)
     return {"ready": True, "workspace": workspace.name, "starter_artifacts": applied}
 
 
 @app.post("/api/workspace/students/archive")
 async def archive_student_workspace(
     request: StudentArchiveRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=64),
     token_payload: dict = Depends(require_service_scope("workspace:write", "workspace")),
 ):
     namespace = resolve_namespace(request.namespace)
@@ -2849,40 +3669,65 @@ async def archive_student_workspace(
             raise
         namespace_exists = False
 
-    if namespace_exists:
-        annotations = existing_namespace.metadata.annotations or {}
-        labels = existing_namespace.metadata.labels or {}
-        recorded_course_id = annotations.get("jcode.io/course-id") or labels.get("jcode.io/course-id")
-        if recorded_course_id and recorded_course_id != str(request.course_id):
-            if source.exists():
-                raise HTTPException(
-                    status_code=409,
-                    detail="Namespace가 다른 강의에 재사용되었고 동일한 Workspace 경로가 존재합니다.",
+    with student_workspace_lock(source.name):
+        assignment_targets = [] if not source.is_dir() else [
+            child
+            for child in source.iterdir()
+            if child.is_dir()
+            and not child.is_symlink()
+            and re.fullmatch(r"assignment-[1-9][0-9]*", child.name)
+        ]
+        if namespace_exists:
+            annotations = existing_namespace.metadata.annotations or {}
+            labels = existing_namespace.metadata.labels or {}
+            recorded_course_id = annotations.get("jcode.io/course-id") or labels.get("jcode.io/course-id")
+            if recorded_course_id and recorded_course_id != str(request.course_id):
+                if source.exists():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Namespace가 다른 강의에 재사용되었고 동일한 Workspace 경로가 존재합니다.",
+                    )
+                return {
+                    "archived": True,
+                    "archive_key": request.archive_key,
+                    "namespace_reused": True,
+                }
+            verify_course_namespace(core_api, namespace, request.course_id)
+            apps_api = client.AppsV1Api()
+            for name in request.deployments:
+                delete_deployment(apps_api, namespace, name)
+            for name in request.services:
+                delete_service(core_api, namespace, name)
+            if not wait_for_jcodes_deleted(apps_api, core_api, namespace, request.deployments):
+                raise HTTPException(status_code=503, detail="사용자 JCode 종료 확인 시간이 초과되었습니다.")
+        if source.exists() and destination.exists():
+            raise HTTPException(status_code=409, detail="학생 Workspace 원본과 보관본이 함께 존재합니다.")
+        if source.exists():
+            for target in assignment_targets:
+                write_system_mutation_marker(
+                    target, "in_progress", "membership-archive", idempotency_key
                 )
-            return {
-                "archived": True,
-                "archive_key": request.archive_key,
-                "namespace_reused": True,
-            }
-        verify_course_namespace(core_api, namespace, request.course_id)
-        apps_api = client.AppsV1Api()
-        for name in request.deployments:
-            delete_deployment(apps_api, namespace, name)
-        for name in request.services:
-            delete_service(core_api, namespace, name)
-    if source.exists() and destination.exists():
-        raise HTTPException(status_code=409, detail="학생 Workspace 원본과 보관본이 함께 존재합니다.")
-    if source.exists():
-        move_directory_safely(
-            source,
-            destination,
-            {
-                "course_id": request.course_id,
-                "student_num": request.student_num,
-                "retention_days": request.retention_days,
-                "archived_at": int(time.time()),
-            },
-        )
+            archive_completed = False
+            try:
+                move_directory_safely(
+                    source,
+                    destination,
+                    {
+                        "course_id": request.course_id,
+                        "student_num": request.student_num,
+                        "retention_days": request.retention_days,
+                        "archived_at": int(time.time()),
+                    },
+                )
+                archive_completed = True
+            finally:
+                for target in assignment_targets:
+                    write_system_mutation_marker(
+                        target,
+                        "completed" if archive_completed else "failed",
+                        "membership-archive",
+                        idempotency_key,
+                    )
     return {"archived": True, "archive_key": request.archive_key}
 
 
