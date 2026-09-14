@@ -71,10 +71,16 @@ spec:
             - name: squid-config
               mountPath: /etc/squid/squid.conf
               subPath: squid.conf
+            - name: squid-peek-tls
+              mountPath: /etc/squid/peek-tls
+              readOnly: true
       volumes:
         - name: squid-config
           configMap:
             name: squid-config
+        - name: squid-peek-tls
+          secret:
+            secretName: jcode-squid-peek-tls
 ---
 apiVersion: v1
 kind: Service
