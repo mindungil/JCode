@@ -49,6 +49,9 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
 RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot && \
     test ! -e /usr/lib/code-server/lib/vscode/extensions/copilot
 
+COPY --from=jcode-extension-policy patch.cjs /opt/jcode/extension-policy-patch.cjs
+RUN /usr/lib/code-server/lib/node /opt/jcode/extension-policy-patch.cjs
+
 RUN mkdir -p /home/coder/.config/pip \
       /home/coder/.config/tigervnc \
       /home/coder/.ipython/profile_default/startup \

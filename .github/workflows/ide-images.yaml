@@ -56,6 +56,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: image/code-server
+          build-contexts: |
+            jcode-extension-policy=./image/extension-policy
           push: true
           build-args: |
             JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
@@ -69,6 +71,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: image/code-server-vnc
+          build-contexts: |
+            jcode-extension-policy=./image/extension-policy
           push: true
           build-args: |
             JCODE_CODE_SERVER_BASE=${{ env.REGISTRY }}/${{ env.PROJECT }}/jcode-codeserver@${{ inputs.base_digest }}
