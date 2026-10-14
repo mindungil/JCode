@@ -31,3 +31,13 @@ normal Python/C++ language tooling and the VNC variant before deployment.
 Inspector and snapshot sessions use an isolated read-only extension directory
 with a pre-created empty `extensions.json` from a ConfigMap:
 student-controlled extensions must not execute in a manager's inspection session.
+
+## IDE schedule notices
+
+`workspace-notice.js` is installed next to the workbench bundle by
+`workspace-notice-patch.cjs` and loaded from `workbench.html` (same origin, so the
+workbench CSP allows it). It subscribes to the Router stream
+`/jcode/session/<id>/__jcode/notices` and shows a portal-style toast 10, 5 and 1
+minutes before an assignment deadline and 1 minute before a kickoff, because those
+transitions end open IDE connections. Pages without a notice stream (older Router,
+inspector or snapshot sessions) simply show nothing.

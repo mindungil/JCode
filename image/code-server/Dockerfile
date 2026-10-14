@@ -36,6 +36,10 @@ RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot && \
 COPY --from=jcode-extension-policy patch.cjs /opt/jcode/extension-policy-patch.cjs
 RUN /usr/lib/code-server/lib/node /opt/jcode/extension-policy-patch.cjs
 
+# Warn open IDE pages before assignment kickoffs/deadlines restart the workspace.
+COPY --from=jcode-extension-policy workspace-notice.js workspace-notice-patch.cjs /opt/jcode/
+RUN /usr/lib/code-server/lib/node /opt/jcode/workspace-notice-patch.cjs
+
 EXPOSE 8080
 
 USER coder
