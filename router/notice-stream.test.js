@@ -40,9 +40,13 @@ test('notice values are reduced to well-formed transitions', () => {
     ],
   });
   assert.deepEqual(JSON.parse(normalizeNoticeValue(value)), [
-    { id: '60:DEADLINE:1000', assignmentId: 60, assignmentName: 'hw1', kind: 'DEADLINE', at: 1000, readOnlyAfter: true },
-    { id: '<script>', assignmentId: null, assignmentName: '<b>hw</b>', kind: 'KICKOFF', at: 5, readOnlyAfter: false },
+    { id: '60:DEADLINE:1000', assignmentId: 60, assignmentName: 'hw1', kind: 'DEADLINE', at: 1000, readOnlyAfter: true, leadMinutes: null },
+    { id: '<script>', assignmentId: null, assignmentName: '<b>hw</b>', kind: 'KICKOFF', at: 5, readOnlyAfter: false, leadMinutes: null },
   ]);
+  const configured = JSON.parse(normalizeNoticeValue(JSON.stringify({ transitions: [
+    { id: 'a', assignmentName: 'hw', kind: 'DEADLINE', at: 1, leadMinutes: [15, 3, 0, 61, 2.5, 'x'] },
+  ] })));
+  assert.deepEqual(configured[0].leadMinutes, [15, 3]);
   assert.equal(normalizeNoticeValue(null), '[]');
   assert.equal(normalizeNoticeValue('{not json'), '[]');
   assert.equal(scheduleEvent('[]', 7), 'event: schedule\ndata: {"serverTime":7,"transitions":[]}\n\n');
@@ -68,7 +72,7 @@ test('hub sends the current schedule, then only changes, and closes ended sessio
   const sessions = new Set(['user:profile:a']);
   const hub = createNoticeHub({
     readValue: async (key) => values.get(key),
-    profileExists: async (key) => sessions.has(key),
+    sessionActive: async (key) => sessions.has(key),
     now: () => 1_000,
     logger: { error() {} },
   });
@@ -116,7 +120,10 @@ test('hub closes streams at the session expiry and survives Redis errors', async
       if (fail) throw new Error('redis down');
       return null;
     },
-    profileExists: async () => true,
+    sessionActive: async () => {
+      if (fail) throw new Error('redis down');
+      return true;
+    },
     now: () => current,
     logger: { error() {} },
   });
@@ -124,10 +131,27 @@ test('hub closes streams at the session expiry and survives Redis errors', async
   await hub.subscribe(client);
   fail = true;
   await hub.poll();
-  assert.equal(client.ended, false);
-  fail = false;
+  assert.equal(client.ended, false, 'a Redis outage keeps the page subscribed');
   current = 6_000;
   await hub.poll();
-  assert.equal(client.ended, true);
+  assert.equal(client.ended, true, 'expiry is enforced even while Redis is down');
   assert.equal(hub.size(), 0);
+});
+
+test('a hanging Redis call does not block later polls', async () => {
+  let hang = true;
+  const hub = createNoticeHub({
+    readValue: async () => (hang ? new Promise(() => {}) : JSON.stringify({ transitions: [] })),
+    sessionActive: async () => true,
+    now: () => 1_000,
+    logger: { error() {} },
+    timeoutMs: 20,
+  });
+  const client = fakeClient('k');
+  await hub.subscribe(client);
+  await hub.poll();
+  hang = false;
+  await hub.poll();
+  assert.equal(hub.size(), 1);
+  assert.equal(client.writes.length, 1, 'unchanged empty schedule is not resent');
 });

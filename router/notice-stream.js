@@ -24,10 +24,13 @@ function isNoticeProfile(profile, nowEpochSeconds = Math.floor(Date.now() / 1000
 
 function normalizeTransition(value) {
   if (!value || typeof value !== 'object') return null;
-  const { id, assignmentId, assignmentName, kind, at, readOnlyAfter } = value;
+  const { id, assignmentId, assignmentName, kind, at, readOnlyAfter, leadMinutes } = value;
   if (typeof id !== 'string' || id.length === 0 || id.length > 120) return null;
   if (typeof assignmentName !== 'string' || assignmentName.length === 0 || assignmentName.length > 100) return null;
   if (!NOTICE_KINDS.has(kind) || !Number.isFinite(at)) return null;
+  const leads = Array.isArray(leadMinutes)
+    ? leadMinutes.filter((lead) => Number.isInteger(lead) && lead >= 1 && lead <= 60).slice(0, 5)
+    : [];
   return {
     id,
     assignmentId: Number.isFinite(assignmentId) ? assignmentId : null,
@@ -35,6 +38,8 @@ function normalizeTransition(value) {
     kind,
     at,
     readOnlyAfter: readOnlyAfter === true,
+    // Configured by the Backend; the IDE falls back to its defaults when absent.
+    leadMinutes: leads.length > 0 ? leads : null,
   };
 }
 
@@ -55,7 +60,19 @@ function scheduleEvent(transitionsJson, serverTime) {
   return `event: schedule\ndata: {"serverTime":${Number(serverTime)},"transitions":${transitionsJson}}\n\n`;
 }
 
-function createNoticeHub({ readValue, profileExists, now = Date.now, logger = console }) {
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// sessionActive(profileKey) resolves false once the launch profile is gone or its
+// route is no longer current (a policy bump ended this IDE session).
+function createNoticeHub({ readValue, sessionActive, now = Date.now, logger = console, timeoutMs = 3000 }) {
   const channels = new Map();
 
   function unsubscribe(client) {
@@ -84,7 +101,7 @@ function createNoticeHub({ readValue, profileExists, now = Date.now, logger = co
     channel.clients.add(client);
     let current = '[]';
     try {
-      current = normalizeNoticeValue(await readValue(client.key));
+      current = normalizeNoticeValue(await withTimeout(readValue(client.key), timeoutMs));
     } catch (error) {
       logger.error('Notice read failed:', error.message);
     }
@@ -99,32 +116,35 @@ function createNoticeHub({ readValue, profileExists, now = Date.now, logger = co
     if (polling) return;
     polling = true;
     try {
-      for (const [key, channel] of channels.entries()) {
+      for (const [key, channel] of [...channels.entries()]) {
+        // Expiry needs no Redis, so it is enforced even during an outage.
+        for (const client of [...channel.clients]) {
+          if (client.expiresAtMs <= now()) close(client);
+        }
+        if (channel.clients.size === 0) continue;
+        const clients = [...channel.clients];
+        const active = await Promise.all(clients.map((client) => (
+          withTimeout(sessionActive(client.profileKey), timeoutMs).catch((error) => {
+            logger.error('Notice session check failed:', error.message);
+            return true;
+          })
+        )));
+        clients.forEach((client, index) => {
+          if (!active[index]) close(client);
+        });
+        if (channel.clients.size === 0) continue;
         let current;
         try {
-          current = normalizeNoticeValue(await readValue(key));
+          current = normalizeNoticeValue(await withTimeout(readValue(key), timeoutMs));
         } catch (error) {
           // A Redis outage must not drop IDE pages; retry on the next poll.
           logger.error('Notice poll failed:', error.message);
           continue;
         }
-        const changed = current !== channel.last;
+        if (current === channel.last) continue;
         channel.last = current;
-        for (const client of [...channel.clients]) {
-          if (client.expiresAtMs <= now()) {
-            close(client);
-            continue;
-          }
-          try {
-            if (!await profileExists(client.profileKey)) {
-              close(client);
-              continue;
-            }
-          } catch (error) {
-            logger.error('Notice session check failed:', error.message);
-          }
-          if (changed) client.write(scheduleEvent(current, now()));
-        }
+        const event = scheduleEvent(current, now());
+        for (const client of channel.clients) client.write(event);
       }
     } finally {
       polling = false;

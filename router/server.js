@@ -353,25 +353,51 @@ const proxy = createProxyMiddleware({
 
 // IDE 경고 알림(SSE). code-server 화면 스크립트가 같은 세션 경로로 연결한다.
 // 프록시보다 먼저 등록해야 code-server로 전달되지 않는다.
+async function isNoticeSessionCurrent(profile) {
+  const routeKey = routeKeyForProfile(profile);
+  if (!routeKey) return false;
+  return isRouteCurrent(profile, parseRouteValue(await redisClient.get(routeKey)));
+}
+
+function positiveIntervalMs(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isFinite(parsed) && parsed >= 1000 ? parsed : fallback;
+}
+
 const noticeHub = createNoticeHub({
   readValue: (key) => redisClient.get(key),
-  profileExists: async (profileKey) => (await redisClient.exists(profileKey)) === 1,
+  sessionActive: async (profileKey) => {
+    const profile = await redisClient.hGetAll(profileKey);
+    return Boolean(profile && Object.keys(profile).length > 0) && isNoticeSessionCurrent(profile);
+  },
 });
 const noticePollTimer = setInterval(() => {
   noticeHub.poll().catch((error) => console.error('Notice poll failed:', error.message));
-}, Number.parseInt(process.env.NOTICE_POLL_INTERVAL_MS || '5000', 10));
+}, positiveIntervalMs(process.env.NOTICE_POLL_INTERVAL_MS, 5000));
 noticePollTimer.unref();
 const noticeHeartbeatTimer = setInterval(
   () => noticeHub.heartbeat(),
-  Number.parseInt(process.env.NOTICE_HEARTBEAT_MS || '25000', 10)
+  positiveIntervalMs(process.env.NOTICE_HEARTBEAT_MS, 25000)
 );
 noticeHeartbeatTimer.unref();
 
 app.get('/jcode/session/:sessionId/__jcode/notices', ensureAuthenticated, async (req, res) => {
+  // Register before any await: a page that leaves during the profile lookup must
+  // not stay subscribed until its profile expires.
+  let closed = false;
+  let client = null;
+  res.once('close', () => {
+    closed = true;
+    if (client) noticeHub.unsubscribe(client);
+  });
   try {
     const profileKey = `user:profile:${req.params.sessionId}`;
     const profile = await redisClient.hGetAll(profileKey);
-    const eligible = isNoticeProfile(profile) && await canAccessUserProfile(req.user, profile);
+    // A session whose route was dropped by a policy bump is already over.
+    const eligible = isNoticeProfile(profile) &&
+      await canAccessUserProfile(req.user, profile) &&
+      await isNoticeSessionCurrent(profile);
+    if (closed) return;
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
@@ -384,21 +410,16 @@ app.get('/jcode/session/:sessionId/__jcode/notices', ensureAuthenticated, async 
     }
     res.write('retry: 30000\n\n');
     const writable = () => !res.writableEnded && !res.destroyed;
-    const client = {
+    client = {
       key: noticeKeyForProfile(profile),
       profileKey,
       expiresAtMs: Number.parseInt(profile.expiresAt, 10) * 1000,
       write: (chunk) => { if (writable()) res.write(chunk); },
       end: () => { if (writable()) res.end(); },
     };
-    let closed = false;
-    req.on('close', () => {
-      closed = true;
-      noticeHub.unsubscribe(client);
-    });
     await noticeHub.subscribe(client);
     // The page may have gone away while the first value was being read.
-    if (closed) noticeHub.unsubscribe(client);
+    if (closed || res.destroyed) noticeHub.unsubscribe(client);
   } catch (error) {
     console.error('Notice stream failed:', error.message);
     if (!res.headersSent) res.status(503).end();
