@@ -19,6 +19,11 @@ const {
   profileAccessRequirement,
   metricRoute,
 } = require('./session-routing');
+const {
+  noticeKeyForProfile,
+  isNoticeProfile,
+  createNoticeHub,
+} = require('./notice-stream');
 require('dotenv').config();
 
 const app = express();
@@ -344,6 +349,61 @@ const proxy = createProxyMiddleware({
     }
     return req.targetUrl;
   },
+});
+
+// IDE 경고 알림(SSE). code-server 화면 스크립트가 같은 세션 경로로 연결한다.
+// 프록시보다 먼저 등록해야 code-server로 전달되지 않는다.
+const noticeHub = createNoticeHub({
+  readValue: (key) => redisClient.get(key),
+  profileExists: async (profileKey) => (await redisClient.exists(profileKey)) === 1,
+});
+const noticePollTimer = setInterval(() => {
+  noticeHub.poll().catch((error) => console.error('Notice poll failed:', error.message));
+}, Number.parseInt(process.env.NOTICE_POLL_INTERVAL_MS || '5000', 10));
+noticePollTimer.unref();
+const noticeHeartbeatTimer = setInterval(
+  () => noticeHub.heartbeat(),
+  Number.parseInt(process.env.NOTICE_HEARTBEAT_MS || '25000', 10)
+);
+noticeHeartbeatTimer.unref();
+
+app.get('/jcode/session/:sessionId/__jcode/notices', ensureAuthenticated, async (req, res) => {
+  try {
+    const profileKey = `user:profile:${req.params.sessionId}`;
+    const profile = await redisClient.hGetAll(profileKey);
+    const eligible = isNoticeProfile(profile) && await canAccessUserProfile(req.user, profile);
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    if (!eligible) {
+      // The page stops reconnecting: inspector, snapshot and expired sessions get no notices.
+      return res.end('event: disabled\ndata: {}\n\n');
+    }
+    res.write('retry: 30000\n\n');
+    const writable = () => !res.writableEnded && !res.destroyed;
+    const client = {
+      key: noticeKeyForProfile(profile),
+      profileKey,
+      expiresAtMs: Number.parseInt(profile.expiresAt, 10) * 1000,
+      write: (chunk) => { if (writable()) res.write(chunk); },
+      end: () => { if (writable()) res.end(); },
+    };
+    let closed = false;
+    req.on('close', () => {
+      closed = true;
+      noticeHub.unsubscribe(client);
+    });
+    await noticeHub.subscribe(client);
+    // The page may have gone away while the first value was being read.
+    if (closed) noticeHub.unsubscribe(client);
+  } catch (error) {
+    console.error('Notice stream failed:', error.message);
+    if (!res.headersSent) res.status(503).end();
+    else res.end();
+  }
 });
 
 // 프록시 라우트
