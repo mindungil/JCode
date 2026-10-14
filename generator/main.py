@@ -95,6 +95,10 @@ WORKSPACE_SETTINGS = {
     "workbench.settings.showAISearchToggle": False,
     "telemetry.telemetryLevel": "off",
 }
+# Closed assignments stay visible but are mounted read-only. The label suffix and
+# editor setting only explain that state; the readOnly volume mount enforces it.
+READ_ONLY_ASSIGNMENT_LABEL_SUFFIX = " (마감)"
+READ_ONLY_SETTING = "files.readonlyInclude"
 CODE_SERVER_POLICY = {
     # Actual AI installation enforcement is in the pinned code-server image.
     "AllowedExtensions": {"*": True},
@@ -194,6 +198,9 @@ class DeployRequest(BaseModel):
     hw_count: int = Field(default=0, ge=0, le=100)
     prac_count: int = Field(default=0, ge=0, le=10)
     assignment_dirs: list[str] = Field(default=[])
+    # Closed assignments that are shown read-only. They are never created here:
+    # a missing live directory is simply not mounted.
+    read_only_assignment_dirs: list[str] = Field(default=[])
     assignment_labels: dict[str, str] = Field(default={})
     policy_revision: int = Field(default=0, ge=0)
     mount_hash: str = Field(default="", pattern=r"^[0-9a-f]{64}$")
@@ -257,6 +264,9 @@ class AssignmentArchiveRequest(BaseModel):
     display_name: Optional[str] = Field(default=None, min_length=1, max_length=50)
     retention_days: int = Field(default=90, ge=1, le=3650)
     finalization_generation: int = Field(default=1, ge=1)
+    # Set by Backends that keep closed assignments mounted read-only. Finalization
+    # then leaves the visibility descriptors to the JCode policy reconciler.
+    retain_workspace_descriptors: bool = False
     starter_artifact_key: Optional[str] = None
     starter_checksum: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     starter_overwrite_policy: str = "PRESERVE_EXISTING"
@@ -504,6 +514,12 @@ def validate_workspace_profile(
 
 
 def validate_deploy_session(request: DeployRequest) -> None:
+    if request.read_only_assignment_dirs and (
+        request.use_snapshot
+        or request.session_kind != "STANDARD"
+        or request.workspace_scope != "COURSE"
+    ):
+        raise HTTPException(status_code=409, detail="읽기 전용 과제 마운트는 강의 단위 일반 세션에서만 사용할 수 있습니다.")
     if request.use_snapshot:
         if request.session_kind not in {"STANDARD", "SNAPSHOT"} or request.assignment_workspace_key is not None:
             raise HTTPException(status_code=409, detail="SNAPSHOT 세션 계약이 올바르지 않습니다.")
@@ -690,7 +706,9 @@ def operation_fingerprint(operation_name: str, request: BaseModel) -> str:
     request_data = request.model_dump(mode="json")
     # These values can legitimately converge while a multi-batch operation is running;
     # they do not change the NFS mutation represented by the operation key.
-    for field in ("display_name", "deployments", "services"):
+    # retain_workspace_descriptors is also excluded so ledgers written before the
+    # field existed stay valid across a rolling Generator/Backend upgrade.
+    for field in ("display_name", "deployments", "services", "retain_workspace_descriptors"):
         request_data.pop(field, None)
     canonical = json.dumps(
         {"operation": operation_name, "request": request_data},
@@ -1005,11 +1023,49 @@ def write_workspace_json(student_dir: Path, filename: str, payload: dict) -> Non
         temporary_path.unlink(missing_ok=True)
 
 
+def assignment_read_only_pattern(workspace_key: str) -> str:
+    return f"{get_workspace_root().rstrip('/')}/assignments/{workspace_key}/**"
+
+
+def read_only_assignment_label(label: str) -> str:
+    # Keep the folder label within the 50 character descriptor limit.
+    return f"{label[:50 - len(READ_ONLY_ASSIGNMENT_LABEL_SUFFIX)].rstrip()}{READ_ONLY_ASSIGNMENT_LABEL_SUFFIX}"
+
+
+def assignment_workspace_settings(workspace_key: str, read_only: bool) -> dict:
+    settings = dict(WORKSPACE_SETTINGS)
+    if read_only:
+        settings[READ_ONLY_SETTING] = {assignment_read_only_pattern(workspace_key): True}
+    return settings
+
+
+def descriptor_marks_read_only(payload: dict, workspace_key: str) -> bool:
+    settings = payload.get("settings") if isinstance(payload, dict) else None
+    patterns = settings.get(READ_ONLY_SETTING) if isinstance(settings, dict) else None
+    return isinstance(patterns, dict) and patterns.get(assignment_read_only_pattern(workspace_key)) is True
+
+
+def read_assignment_descriptor_read_only(student_dir: Path, workspace_key: str) -> bool:
+    descriptor = student_dir / ".jcode" / f"{workspace_key}.code-workspace"
+    if not descriptor.is_file() or descriptor.is_symlink():
+        return False
+    try:
+        return descriptor_marks_read_only(json.loads(descriptor.read_text(encoding="utf-8")), workspace_key)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def read_assignment_workspace_entries(student_dir: Path) -> list[dict[str, str]]:
+    return read_assignment_workspace_folders(student_dir)[0]
+
+
+def read_assignment_workspace_folders(student_dir: Path) -> tuple[list[dict[str, str]], list[str]]:
+    """Return general workspace folders and the closed assignment keys among them."""
     metadata_dir = student_dir / ".jcode"
     if not metadata_dir.is_dir() or metadata_dir.is_symlink():
-        return []
+        return [], []
     entries = []
+    read_only_keys = []
     descriptors = sorted(
         metadata_dir.glob("assignment-*.code-workspace"),
         key=lambda path: int(path.name.removeprefix("assignment-").removesuffix(".code-workspace"))
@@ -1023,12 +1079,15 @@ def read_assignment_workspace_entries(student_dir: Path) -> list[dict[str, str]]
         if not (student_dir / workspace_key).is_dir() or descriptor.is_symlink():
             continue
         try:
-            folders = json.loads(descriptor.read_text(encoding="utf-8")).get("folders", [])
+            payload = json.loads(descriptor.read_text(encoding="utf-8"))
+            folders = payload.get("folders", [])
             label = validate_workspace_display_name(folders[0]["name"], 50)
-        except (OSError, json.JSONDecodeError, IndexError, KeyError, TypeError, HTTPException):
+        except (OSError, json.JSONDecodeError, IndexError, KeyError, TypeError, AttributeError, HTTPException):
             continue
         entries.append({"name": label, "path": f"../assignments/{workspace_key}"})
-    return entries
+        if descriptor_marks_read_only(payload, workspace_key):
+            read_only_keys.append(workspace_key)
+    return entries, read_only_keys
 
 
 def remove_stale_assignment_workspace_descriptors(student_dir: Path, workspace_keys: list[str]) -> None:
@@ -1073,12 +1132,18 @@ def write_general_workspace_descriptor(student_dir: Path, display_name: Optional
     os.chown(personal_workspace, 1000, 1000)
     ensure_personal_workspace_readme(personal_workspace)
     remove_empty_legacy_workspace_dirs(student_dir)
+    assignment_folders, read_only_keys = read_assignment_workspace_folders(student_dir)
+    settings = dict(WORKSPACE_SETTINGS)
+    if read_only_keys:
+        settings[READ_ONLY_SETTING] = {
+            assignment_read_only_pattern(workspace_key): True for workspace_key in read_only_keys
+        }
     payload = {
         "folders": [
             {"name": PERSONAL_WORKSPACE_LABEL, "path": "../workspace"},
-            *read_assignment_workspace_entries(student_dir),
+            *assignment_folders,
         ],
-        "settings": WORKSPACE_SETTINGS,
+        "settings": settings,
     }
     write_workspace_json(student_dir, descriptor_name, payload)
     # Keep the old path during rolling upgrades; new Backend instances open the named file.
@@ -1088,20 +1153,33 @@ def write_general_workspace_descriptor(student_dir: Path, display_name: Optional
             stale.unlink(missing_ok=True)
 
 
-def write_assignment_workspace_descriptor(student_dir: Path, workspace_key: str, display_name: Optional[str]) -> None:
-    """Keep the stable directory key while showing the configured assignment name in code-server."""
+def write_assignment_workspace_descriptor(
+    student_dir: Path,
+    workspace_key: str,
+    display_name: Optional[str],
+    read_only: Optional[bool] = None,
+) -> None:
+    """Keep the stable directory key while showing the configured assignment name in code-server.
+
+    ``read_only=None`` keeps the state chosen by the last JCode policy deploy, so
+    metadata updates cannot make a closed assignment look writable again.
+    """
     if display_name is None:
         return
     label = validate_workspace_display_name(display_name, 50)
-    settings = {"settings": WORKSPACE_SETTINGS}
+    if read_only is None:
+        read_only = read_assignment_descriptor_read_only(student_dir, workspace_key)
+    folder_label = read_only_assignment_label(label) if read_only else label
+    settings = {"settings": assignment_workspace_settings(workspace_key, read_only)}
     write_workspace_json(student_dir, f"{workspace_key}.code-workspace", {
-        "folders": [{"name": label, "path": f"../assignments/{workspace_key}"}],
+        "folders": [{"name": folder_label, "path": f"../assignments/{workspace_key}"}],
         **settings,
     })
     named_dir = student_dir / ".jcode" / "assignments" / workspace_key
+    # The file name follows the plain assignment name; Backend derives the launch path from it.
     named_filename = assignment_workspace_filename(label)
     named_payload = {
-        "folders": [{"name": label, "path": f"../../../assignments/{workspace_key}"}],
+        "folders": [{"name": folder_label, "path": f"../../../assignments/{workspace_key}"}],
         **settings,
     }
     write_workspace_json(student_dir, f"assignments/{workspace_key}/{named_filename}", named_payload)
@@ -1509,6 +1587,7 @@ def health_contract():
             "inspector-read-only",
             "deployment-observed-readiness",
             "durable-batched-workspace-operations",
+            "closed-assignment-read-only-mounts",
         ],
     }
 
@@ -1644,6 +1723,7 @@ def create_deployment(
     workspace_scope: str = "COURSE", assignment_workspace_key: Optional[str] = None,
     policy_revision: int = 0, mount_hash: str = "",
     session_kind: str = "STANDARD", read_only_workspace: bool = False,
+    read_only_assignment_dirs: Optional[list] = None,
 ) -> str:
     init_volume_mounts = []
     isolated_extensions = use_snapshot or session_kind == "INSPECTOR"
@@ -1769,8 +1849,23 @@ def create_deployment(
                     validate_assignment_workspace_key(value) for value in (assignment_dirs or [])
                 ]
             ]
+            # Closed assignments: the kernel enforces read-only access inside the pod.
+            # The init container never needs them.
+            read_only_assignment_mounts = [
+                client.V1VolumeMount(
+                    name="jcode-vol",
+                    mount_path=f"/home/coder/project/assignments/{workspace_key}",
+                    sub_path=f"{file_path.rstrip('/')}/{workspace_key}",
+                    read_only=True,
+                )
+                for workspace_key in [
+                    validate_assignment_workspace_key(value) for value in (read_only_assignment_dirs or [])
+                ]
+            ]
             init_volume_mounts.extend([personal_mount, *assignment_mounts])
-            volume_mounts.extend([personal_mount, metadata_mount, *assignment_mounts])
+            volume_mounts.extend([
+                personal_mount, metadata_mount, *assignment_mounts, *read_only_assignment_mounts,
+            ])
         base_cmd = workspace_cmd
 
     init_command = ["sh", "-c", base_cmd]
@@ -2918,11 +3013,19 @@ async def deploy_resources(
             if request.use_snapshot
             else student_workspace_lock(f"{class_div}-{request.student_num}")
         )
+        mounted_read_only_keys: list[str] = []
         with lock_context:
             prepare_workspace_extension(request.student_num)
             if not request.use_snapshot and request.workspace_scope == "COURSE":
                 workspace_keys = [validate_assignment_workspace_key(value) for value in request.assignment_dirs]
-                unknown_labels = set(request.assignment_labels) - set(workspace_keys)
+                read_only_keys = [
+                    validate_assignment_workspace_key(value) for value in request.read_only_assignment_dirs
+                ]
+                if len(set(workspace_keys)) != len(workspace_keys) or len(set(read_only_keys)) != len(read_only_keys):
+                    raise HTTPException(status_code=400, detail="과제 workspace_key가 중복되었습니다.")
+                if set(workspace_keys) & set(read_only_keys):
+                    raise HTTPException(status_code=400, detail="같은 과제를 쓰기와 읽기 전용으로 함께 마운트할 수 없습니다.")
+                unknown_labels = set(request.assignment_labels) - set(workspace_keys) - set(read_only_keys)
                 if unknown_labels:
                     raise HTTPException(status_code=400, detail="assignment_labels에 알 수 없는 workspace_key가 있습니다.")
                 workspace = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
@@ -2939,8 +3042,22 @@ async def deploy_resources(
                         workspace,
                         workspace_key,
                         request.assignment_labels.get(workspace_key),
+                        read_only=False,
                     )
-                remove_stale_assignment_workspace_descriptors(workspace, workspace_keys)
+                for workspace_key in read_only_keys:
+                    assignment_path = workspace / workspace_key
+                    reject_symlink_path(workspace, assignment_path)
+                    # Never create or chown a closed assignment. Creating it would hide a
+                    # legacy final archive from restore/archive and make reopen fail.
+                    if assignment_path.is_dir():
+                        mounted_read_only_keys.append(workspace_key)
+                    write_assignment_workspace_descriptor(
+                        workspace,
+                        workspace_key,
+                        request.assignment_labels.get(workspace_key),
+                        read_only=True,
+                    )
+                remove_stale_assignment_workspace_descriptors(workspace, [*workspace_keys, *read_only_keys])
                 write_general_workspace_descriptor(workspace, request.workspace_display_name)
             ensure_code_server_config(core_v1_api, namespace)
 
@@ -2966,6 +3083,7 @@ async def deploy_resources(
                 request.mount_hash,
                 request.session_kind,
                 request.read_only_workspace,
+                mounted_read_only_keys,
             )
             service_msg = create_service(
                 core_v1_api,
@@ -3427,6 +3545,7 @@ def move_assignment_between_workspace_and_final_archive(
     display_name: Optional[str] = None,
     finalization_generation: int = 1,
     student_directories: Optional[list[Path]] = None,
+    retain_descriptors: bool = False,
 ) -> int:
     class_div = namespace[len(COURSE_NAMESPACE_PREFIX):]
     archive_root = get_workspace_archive_root()
@@ -3450,7 +3569,8 @@ def move_assignment_between_workspace_and_final_archive(
                         status_code=409,
                         detail=f"최종본 없이 Workspace만 남아 있습니다: {student_dir.name}",
                     )
-                remove_assignment_workspace_descriptor(student_dir, workspace_key)
+                if not retain_descriptors:
+                    remove_assignment_workspace_descriptor(student_dir, workspace_key)
                 continue
             if restore:
                 destination.mkdir(parents=True, exist_ok=True)
@@ -3477,9 +3597,10 @@ def move_assignment_between_workspace_and_final_archive(
                 },
             )
             if not copied:
-                remove_assignment_workspace_descriptor(student_dir, workspace_key)
+                if not retain_descriptors:
+                    remove_assignment_workspace_descriptor(student_dir, workspace_key)
                 continue
-        if not restore:
+        if not restore and not retain_descriptors:
             remove_assignment_workspace_descriptor(student_dir, workspace_key)
         moved += 1
     return moved
@@ -3511,6 +3632,7 @@ async def finalize_assignment_workspace(
             restore=False,
             finalization_generation=request.finalization_generation,
             student_directories=[student_dir],
+            retain_descriptors=request.retain_workspace_descriptors,
         )
         return {"moved": moved}
 
