@@ -35,11 +35,16 @@ function setup({ path = '/jcode/session/abc-123/', now = 1_000_000 } = {}) {
   }
   FakeEventSource.CLOSED = 2;
   window.EventSource = FakeEventSource;
+  let closed = 0;
+  window.close = () => { closed += 1; };
   window.eval(SCRIPT);
   window.document.dispatchEvent(new window.Event('DOMContentLoaded'));
   return {
     window,
     sources,
+    closedCount: () => closed,
+    runTimeouts(ms) { clock += ms; timers.filter((t) => typeof t === 'object').splice(0).forEach((t) => t.fn()); },
+    overlay: () => window.document.querySelector('.jcode-session-ended')?.textContent || null,
     tick(ms) {
       clock += ms;
       timers.filter((t) => typeof t === 'function').forEach((fn) => fn());
@@ -215,4 +220,37 @@ test('warning times sent by the Backend replace the built-in defaults', () => {
   page.tick(12 * minute);
   assert.equal(page.toasts()[0].title, '"hw8" 과제가 3분 후 마감됩니다');
   assert.equal(page.toasts()[0].progress, false, 'the last configured warning stays on screen');
+});
+
+test('a restart notice counts down, then closes the IDE with a message', () => {
+  const page = setup();
+  page.sources[0].emit('restart', { id: '9', reason: 'ASSIGNMENT_CREATED', at: 1_000_000 + 5000, serverTime: 1_000_000 });
+  assert.equal(page.toasts()[0].title, '새 과제가 등록되었습니다');
+  assert.match(page.toasts()[0].text, /5초 후 IDE가 닫힙니다/);
+  page.runTimeouts(5100);
+  for (let i = 0; i < 3; i += 1) page.runTimeouts(300);
+  assert.match(page.overlay(), /새 과제가 등록되었습니다/);
+  assert.equal(page.closedCount() >= 1, true);
+  // A repeated delivery of the same notice does nothing more.
+  page.sources[0].emit('restart', { id: '9', reason: 'ASSIGNMENT_CREATED', at: 1_000_000 + 5000, serverTime: 1_000_000 });
+  assert.equal(page.window.document.querySelectorAll('.jcode-session-ended').length, 1);
+});
+
+test('a session ended by the router closes after five seconds with the reason', () => {
+  const page = setup();
+  page.sources[0].emit('closed', { reason: 'expired' });
+  assert.match(page.overlay(), /IDE 사용 시간이 끝났습니다/);
+  assert.match(page.overlay(), /5초 후 이 창이 닫힙니다/);
+  assert.equal(page.closedCount(), 0);
+  for (let i = 0; i < 25; i += 1) page.runTimeouts(250);
+  assert.equal(page.closedCount() >= 1, true);
+  assert.equal(page.sources[0].readyState, 2, 'notice stream stops');
+});
+
+test('toasts wrap at word boundaries in a wider box', () => {
+  const page = setup();
+  page.sources[0].emit('schedule', { serverTime: 1_000_000, transitions: [{ id: 'w', assignmentName: 'hw', kind: 'DEADLINE', at: 1_000_000 + 60_000 }] });
+  const css = page.window.document.getElementById('jcode-notice-style').textContent;
+  assert.match(css, /width:400px/);
+  assert.match(css, /word-break:keep-all/);
 });

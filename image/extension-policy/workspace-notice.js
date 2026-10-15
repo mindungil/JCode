@@ -2,9 +2,12 @@
 //
 // Assignment kickoffs and deadlines restart course workspaces and end open IDE
 // connections. The Router streams the upcoming transitions of this session's
-// course; this script warns the student in advance with a toast styled like the
-// JCode portal (react-toastify, top center). Server values are rendered with
-// textContent only.
+// course and, for unscheduled changes such as a new assignment, a restart notice
+// a few seconds before this session is ended. This script warns with a toast
+// styled like the JCode portal (react-toastify, top center) and, once the session
+// ends, closes the tab with a message instead of letting the IDE reconnect
+// forever. Files are already saved by code-server's default auto save (1 s).
+// Server values are rendered with textContent only.
 (() => {
   'use strict';
 
@@ -23,6 +26,23 @@
   const CLOSE_ICON = 'M7.71 8.23l3.75 3.75-1.48 1.48-3.75-3.75-3.75 3.75L1 11.98l3.75-3.75L1 4.48 2.48 3l3.75 3.75L9.98 3l1.48 1.48-3.75 3.75z';
 
   const MAX_FAILED_CONNECTS = 6;
+  const CLOSE_DELAY_MS = 5000;
+  const PORTAL_URL = '/';
+  const REASON_TEXT = {
+    ASSIGNMENT_CREATED: '새 과제가 등록되었습니다',
+    ASSIGNMENT_UPDATED: '과제 설정이 변경되었습니다',
+    ASSIGNMENT_DELETED: '과제가 삭제되었습니다',
+    ASSIGNMENT_OPENED: '새 과제가 시작되었습니다',
+    ASSIGNMENT_CLOSED: '과제가 마감되었습니다',
+    ASSIGNMENT_REOPENED: '과제가 다시 열렸습니다',
+    STARTER_DISTRIBUTED: '스타터 코드가 배포되었습니다',
+    MEMBER_ROLE_CHANGED: '강의 역할이 변경되었습니다',
+    PROFILE_CHANGED: '사용자 정보가 변경되었습니다',
+  };
+  const CLOSED_TEXT = {
+    expired: 'IDE 사용 시간이 끝났습니다',
+    ended: 'IDE 연결이 종료되었습니다',
+  };
 
   let transitions = [];
   let offsetMs = 0;
@@ -65,7 +85,7 @@
     style.id = 'jcode-notice-style';
     style.textContent = `
       .jcode-notice-container{position:fixed;z-index:2147483000;top:max(16px,env(safe-area-inset-top));left:50%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:1rem;pointer-events:none;box-sizing:border-box}
-      .jcode-notice{position:relative;pointer-events:auto;width:320px;max-width:calc(100vw - 32px);min-height:64px;box-sizing:border-box;padding:14px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.1);display:flex;align-items:center;word-break:break-word;font-family:${FONT};font-size:13px;line-height:1.45;overflow:hidden;animation:jcode-notice-in .45s both}
+      .jcode-notice{position:relative;pointer-events:auto;width:400px;max-width:calc(100vw - 32px);min-height:64px;box-sizing:border-box;padding:14px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.1);display:flex;align-items:center;word-break:keep-all;overflow-wrap:anywhere;font-family:${FONT};font-size:13px;line-height:1.45;overflow:hidden;animation:jcode-notice-in .45s both}
       .jcode-notice--light{background:#fff;color:#757575}
       .jcode-notice--dark{background:#121212;color:#fff}
       .jcode-notice__icon{margin-inline-end:10px;width:22px;flex-shrink:0;display:flex;color:#f1c40f}
@@ -80,6 +100,11 @@
       .jcode-notice__progress-bg{width:100%;height:100%;background:#f1c40f;opacity:.2}
       .jcode-notice__progress-bar{position:absolute;inset:0;background:#f1c40f;opacity:.7;transform-origin:left;animation:jcode-notice-progress linear forwards}
       .jcode-notice:hover .jcode-notice__progress-bar{animation-play-state:paused}
+      .jcode-session-ended{position:fixed;inset:0;z-index:2147483001;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);font-family:${FONT}}
+      .jcode-session-ended__box{max-width:420px;margin:16px;padding:24px;border-radius:6px;background:#fff;color:#424242;box-shadow:0 4px 12px rgba(0,0,0,.2);word-break:keep-all;overflow-wrap:anywhere;line-height:1.5}
+      .jcode-session-ended--dark .jcode-session-ended__box{background:#121212;color:#fff}
+      .jcode-session-ended__title{display:block;font-size:16px;font-weight:700;margin-bottom:8px}
+      .jcode-session-ended__link{display:inline-block;margin-top:16px;padding:6px 14px;border-radius:4px;background:#1976d2;color:#fff;text-decoration:none}
       @keyframes jcode-notice-progress{from{transform:scaleX(1)}to{transform:scaleX(0)}}
       @keyframes jcode-notice-in{from{opacity:0;transform:translate3d(0,-60px,0)}to{opacity:1;transform:none}}
     `;
@@ -174,20 +199,18 @@
     const when = minutesLabel(remainingMs);
     const name = transition.assignmentName;
     if (transition.kind === 'DEADLINE') {
-      const readOnly = transition.readOnlyAfter
-        ? ' 마감 후 이 과제는 읽기 전용으로 바뀝니다.'
-        : '';
+      const readOnly = transition.readOnlyAfter ? ' 마감 후에는 읽기 전용으로 볼 수 있습니다.' : '';
       showToast(
         transition.id,
         `"${name}" 과제가 ${when} 마감됩니다`,
-        `마감되면 이 IDE 연결이 끊깁니다. 작업 중인 파일을 지금 저장하세요.${readOnly} 다른 작업은 JCode 포털에서 다시 실행해 이어갈 수 있습니다.`,
+        `마감되면 IDE가 닫힙니다. 작업 내용은 자동 저장됩니다.${readOnly}`,
         autoClose
       );
     } else {
       showToast(
         transition.id,
         `새 과제 "${name}"이(가) ${when} 시작됩니다`,
-        '과제가 시작되면 이 IDE 연결이 끊깁니다. 작업 중인 파일을 저장하고, 연결이 끊기면 JCode 포털에서 다시 실행하세요.',
+        '시작되면 IDE가 닫힙니다. JCode 포털에서 다시 실행하면 새 과제가 보입니다.',
         autoClose
       );
     }
@@ -231,13 +254,83 @@
     check();
   }
 
+  let ending = false;
+  let source = null;
+
+  // The session is over: say why and close the tab (the portal opened it). If the
+  // browser keeps the tab open, the message stays instead of an endless spinner.
+  function endSession(title, delayMs) {
+    if (ending) return;
+    ending = true;
+    if (source) source.close();
+    installStyles();
+    const overlay = document.createElement('div');
+    overlay.className = `jcode-session-ended${isDark() ? ' jcode-session-ended--dark' : ''}`;
+    overlay.setAttribute('role', 'alertdialog');
+    const box = document.createElement('div');
+    box.className = 'jcode-session-ended__box';
+    const heading = document.createElement('strong');
+    heading.className = 'jcode-session-ended__title';
+    heading.textContent = title;
+    const text = document.createElement('span');
+    const link = document.createElement('a');
+    link.className = 'jcode-session-ended__link';
+    link.href = PORTAL_URL;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = 'JCode 포털 열기';
+    box.append(heading, text, document.createElement('br'), link);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    const closeAt = Date.now() + delayMs;
+    const tick = () => {
+      const seconds = Math.ceil((closeAt - Date.now()) / 1000);
+      if (seconds > 0) {
+        text.textContent = `작업 내용은 자동 저장되었습니다. ${seconds}초 후 이 창이 닫힙니다. JCode 포털에서 다시 실행하세요.`;
+        window.setTimeout(tick, 250);
+        return;
+      }
+      text.textContent = '작업 내용은 자동 저장되었습니다. 이 창을 닫고 JCode 포털에서 다시 실행하세요.';
+      window.close();
+    };
+    tick();
+  }
+
+  // An unscheduled change (for example a new assignment) restarts this workspace
+  // after a short grace period announced by the Backend.
+  function applyRestart(data) {
+    if (ending || !data || typeof data.id !== 'string' || !Number.isFinite(data.at)) return;
+    const key = `restart:${data.id}`;
+    if (alreadyShown(key)) return;
+    markShown(key);
+    if (Number.isFinite(data.serverTime)) offsetMs = data.serverTime - Date.now();
+    const title = REASON_TEXT[data.reason] || '강의 환경이 변경되었습니다';
+    installStyles();
+    showToast(key, title, '', false);
+    const toast = toastsByTransition.get(key) && [...toastsByTransition.get(key)][0];
+    const body = toast && toast.querySelector('.jcode-notice__body span');
+    const tick = () => {
+      if (ending) return;
+      const remaining = data.at - serverNow();
+      if (remaining <= 0) {
+        retractToasts(key);
+        endSession(title, 0);
+        return;
+      }
+      if (body) body.textContent = `${Math.ceil(remaining / 1000)}초 후 IDE가 닫힙니다. 작업 내용은 자동 저장됩니다.`;
+      window.setTimeout(tick, 250);
+    };
+    tick();
+  }
+
   let retryMs = 5000;
   let failedConnects = 0;
   let connected = false;
   let stopped = false;
   function connect() {
+    if (ending) return;
     connected = true;
-    const source = new EventSource(ENDPOINT, { withCredentials: true });
+    source = new EventSource(ENDPOINT, { withCredentials: true });
     source.addEventListener('schedule', (event) => {
       retryMs = 5000;
       failedConnects = 0;
@@ -246,6 +339,22 @@
       } catch (_) {
         // Ignore a malformed message; the next update replaces the schedule.
       }
+    });
+    source.addEventListener('restart', (event) => {
+      try {
+        applyRestart(JSON.parse(event.data));
+      } catch (_) {
+        // Ignore a malformed message.
+      }
+    });
+    source.addEventListener('closed', (event) => {
+      let reason = 'ended';
+      try {
+        reason = JSON.parse(event.data).reason || reason;
+      } catch (_) {
+        // Keep the generic reason.
+      }
+      endSession(CLOSED_TEXT[reason] || CLOSED_TEXT.ended, CLOSE_DELAY_MS);
     });
     source.addEventListener('disabled', () => {
       stopped = true;
