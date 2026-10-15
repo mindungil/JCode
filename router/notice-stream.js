@@ -155,6 +155,9 @@ function createNoticeHub({ readValue, sessionActive, now = Date.now, logger = co
       return;
     }
     if (!notice || notice.id === client.lastRestartId) return;
+    // The notice stays in Redis for a while after the restart; a session opened on
+    // that (or a later) revision is already the restarted IDE and must not close.
+    if (/^[0-9]+$/.test(String(client.revision || '')) && Number(notice.id) <= Number(client.revision)) return;
     client.lastRestartId = notice.id;
     client.write(restartEvent(notice, now()));
   }

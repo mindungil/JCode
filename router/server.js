@@ -416,6 +416,7 @@ app.get('/jcode/session/:sessionId/__jcode/notices', ensureAuthenticated, async 
     client = {
       key: noticeKeyForProfile(profile),
       restartKey: restartKeyForProfile(profile),
+      revision: profile.revision,
       schedule: wantsSchedule(profile),
       profileKey,
       expiresAtMs: Number.parseInt(profile.expiresAt, 10) * 1000,

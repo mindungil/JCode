@@ -199,3 +199,22 @@ test('expired sessions get a closed event and non-students get no schedule', asy
   await hub.poll();
   assert.match(professor.writes.at(-1), /"reason":"expired"/);
 });
+
+test('a restart notice is not sent to a session already on that revision', async () => {
+  const values = new Map();
+  const hub = createNoticeHub({
+    readValue: async (key) => values.get(key) || null,
+    sessionActive: async () => true,
+    now: () => 1_000,
+    logger: { error() {} },
+  });
+  const { restartKeyForProfile } = require('./notice-stream');
+  const restartKey = restartKeyForProfile({ jcodeId: '912' });
+  values.set(restartKey, JSON.stringify({ id: '7', reason: 'ASSIGNMENT_REOPENED', at: 900 }));
+  const restarted = fakeClient('k', { restartKey, revision: '7' });
+  const stale = fakeClient('k', { restartKey, revision: '6' });
+  await hub.subscribe(restarted);
+  await hub.subscribe(stale);
+  assert.equal(restarted.writes.filter((w) => w.startsWith('event: restart')).length, 0);
+  assert.equal(stale.writes.filter((w) => w.startsWith('event: restart')).length, 1);
+});
