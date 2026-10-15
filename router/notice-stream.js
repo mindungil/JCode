@@ -7,6 +7,29 @@
 
 const NOTICE_KEY_PREFIX = 'jcode:notices:course:';
 const NOTICE_KINDS = new Set(['KICKOFF', 'DEADLINE']);
+const REASON_PATTERN = /^[A-Z_]{1,40}$/;
+
+// Written by the Backend when a policy change is about to restart this JCode.
+function restartKeyForProfile(profile) {
+  return profile && /^[0-9]+$/.test(String(profile.jcodeId || '')) ? `jcode:notices:jcode:${profile.jcodeId}:restart` : null;
+}
+
+// Schedule warnings concern students only; other course roles are not restarted
+// by kickoffs and deadlines. Profiles without a role predate the field.
+function wantsSchedule(profile) {
+  return !profile || !profile.courseRole || profile.courseRole === 'STUDENT';
+}
+
+function normalizeRestartValue(value) {
+  if (!value) return null;
+  try {
+    const { id, reason, at } = JSON.parse(value) || {};
+    if (typeof id !== 'string' || id.length === 0 || id.length > 40 || !Number.isFinite(at)) return null;
+    return { id, reason: REASON_PATTERN.test(reason || '') ? reason : 'POLICY_CHANGED', at };
+  } catch (_) {
+    return null;
+  }
+}
 
 function noticeKeyForProfile(profile) {
   if (!profile || !profile.courseCode || !profile.clss) return null;
@@ -60,6 +83,14 @@ function scheduleEvent(transitionsJson, serverTime) {
   return `event: schedule\ndata: {"serverTime":${Number(serverTime)},"transitions":${transitionsJson}}\n\n`;
 }
 
+function restartEvent(notice, serverTime) {
+  return `event: restart\ndata: ${JSON.stringify({ ...notice, serverTime: Number(serverTime) })}\n\n`;
+}
+
+function closedEvent(reason) {
+  return `event: closed\ndata: ${JSON.stringify({ reason })}\n\n`;
+}
+
 function withTimeout(promise, ms) {
   let timer;
   return Promise.race([
@@ -82,9 +113,11 @@ function createNoticeHub({ readValue, sessionActive, now = Date.now, logger = co
     if (channel.clients.size === 0) channels.delete(client.key);
   }
 
-  function close(client) {
+  // The page shows why the IDE stopped instead of reconnecting forever.
+  function close(client, reason) {
     unsubscribe(client);
     try {
+      if (reason) client.write(closedEvent(reason));
       client.end();
     } catch (_) {
       // The connection may already be gone.
@@ -108,7 +141,22 @@ function createNoticeHub({ readValue, sessionActive, now = Date.now, logger = co
     // Only a new channel adopts this value; otherwise the next poll still
     // notices the change and delivers it to the existing subscribers too.
     if (created) channel.last = current;
-    client.write(scheduleEvent(current, now()));
+    client.write(scheduleEvent(client.schedule === false ? '[]' : current, now()));
+    await deliverRestart(client);
+  }
+
+  async function deliverRestart(client, value) {
+    if (!client.restartKey) return;
+    let notice = null;
+    try {
+      notice = normalizeRestartValue(value !== undefined ? value : await withTimeout(readValue(client.restartKey), timeoutMs));
+    } catch (error) {
+      logger.error('Restart notice read failed:', error.message);
+      return;
+    }
+    if (!notice || notice.id === client.lastRestartId) return;
+    client.lastRestartId = notice.id;
+    client.write(restartEvent(notice, now()));
   }
 
   let polling = false;
@@ -119,19 +167,28 @@ function createNoticeHub({ readValue, sessionActive, now = Date.now, logger = co
       for (const [key, channel] of [...channels.entries()]) {
         // Expiry needs no Redis, so it is enforced even during an outage.
         for (const client of [...channel.clients]) {
-          if (client.expiresAtMs <= now()) close(client);
+          if (client.expiresAtMs <= now()) close(client, 'expired');
         }
         if (channel.clients.size === 0) continue;
         const clients = [...channel.clients];
-        const active = await Promise.all(clients.map((client) => (
-          withTimeout(sessionActive(client.profileKey), timeoutMs).catch((error) => {
-            logger.error('Notice session check failed:', error.message);
-            return true;
-          })
-        )));
-        clients.forEach((client, index) => {
-          if (!active[index]) close(client);
-        });
+        const [active, restarts] = await Promise.all([
+          Promise.all(clients.map((client) => (
+            withTimeout(sessionActive(client.profileKey), timeoutMs).catch((error) => {
+              logger.error('Notice session check failed:', error.message);
+              return true;
+            })
+          ))),
+          Promise.all(clients.map((client) => (
+            client.restartKey
+              ? withTimeout(readValue(client.restartKey), timeoutMs).catch(() => null)
+              : null
+          ))),
+        ]);
+        for (const [index, client] of clients.entries()) {
+          // A pending restart is announced before the session ends.
+          await deliverRestart(client, restarts[index]);
+          if (!active[index]) close(client, 'ended');
+        }
         if (channel.clients.size === 0) continue;
         let current;
         try {
@@ -144,7 +201,9 @@ function createNoticeHub({ readValue, sessionActive, now = Date.now, logger = co
         if (current === channel.last) continue;
         channel.last = current;
         const event = scheduleEvent(current, now());
-        for (const client of channel.clients) client.write(event);
+        for (const client of channel.clients) {
+          if (client.schedule !== false) client.write(event);
+        }
       }
     } finally {
       polling = false;
@@ -167,6 +226,9 @@ function createNoticeHub({ readValue, sessionActive, now = Date.now, logger = co
 }
 
 module.exports = {
+  restartKeyForProfile,
+  wantsSchedule,
+  normalizeRestartValue,
   noticeKeyForProfile,
   isNoticeProfile,
   normalizeNoticeValue,

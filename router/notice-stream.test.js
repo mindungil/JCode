@@ -155,3 +155,47 @@ test('a hanging Redis call does not block later polls', async () => {
   assert.equal(hub.size(), 1);
   assert.equal(client.writes.length, 1, 'unchanged empty schedule is not resent');
 });
+
+test('a pending restart is announced once, then the ended session is told why it closed', async () => {
+  const values = new Map([['k', JSON.stringify({ transitions: [] })]]);
+  let active = true;
+  const hub = createNoticeHub({
+    readValue: async (key) => values.get(key),
+    sessionActive: async () => active,
+    now: () => 1_000,
+    logger: { error() {} },
+  });
+  const { restartKeyForProfile } = require('./notice-stream');
+  const client = fakeClient('k', { restartKey: restartKeyForProfile({ jcodeId: '912' }) });
+  assert.equal(client.restartKey, 'jcode:notices:jcode:912:restart');
+  await hub.subscribe(client);
+  values.set(client.restartKey, JSON.stringify({ id: '7', reason: 'ASSIGNMENT_CREATED', at: 6_000 }));
+  await hub.poll();
+  await hub.poll();
+  const restarts = client.writes.filter((w) => w.startsWith('event: restart'));
+  assert.equal(restarts.length, 1, 'same notice is not repeated');
+  assert.match(restarts[0], /"reason":"ASSIGNMENT_CREATED".*"at":6000.*"serverTime":1000/);
+  active = false;
+  await hub.poll();
+  assert.match(client.writes.at(-1), /^event: closed\ndata: \{"reason":"ended"\}/);
+  assert.equal(client.ended, true);
+});
+
+test('expired sessions get a closed event and non-students get no schedule', async () => {
+  const { wantsSchedule, normalizeRestartValue } = require('./notice-stream');
+  assert.equal(wantsSchedule({ courseRole: 'STUDENT' }), true);
+  assert.equal(wantsSchedule({}), true);
+  assert.equal(wantsSchedule({ courseRole: 'PROFESSOR' }), false);
+  assert.deepEqual(normalizeRestartValue('{"id":"3","reason":"<x>","at":5}'), { id: '3', reason: 'POLICY_CHANGED', at: 5 });
+  assert.equal(normalizeRestartValue('{"id":"3"}'), null);
+
+  let current = 1_000;
+  const values = new Map([['k', JSON.stringify({ transitions: [{ id: 'd', assignmentName: 'hw', kind: 'DEADLINE', at: 9 }] })]]);
+  const hub = createNoticeHub({ readValue: async (key) => values.get(key), sessionActive: async () => true, now: () => current, logger: { error() {} } });
+  const professor = fakeClient('k', { schedule: false, expiresAtMs: 2_000 });
+  await hub.subscribe(professor);
+  assert.match(professor.writes[0], /"transitions":\[\]/);
+  current = 2_000;
+  await hub.poll();
+  assert.match(professor.writes.at(-1), /"reason":"expired"/);
+});

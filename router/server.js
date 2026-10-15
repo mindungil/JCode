@@ -21,6 +21,8 @@ const {
 } = require('./session-routing');
 const {
   noticeKeyForProfile,
+  restartKeyForProfile,
+  wantsSchedule,
   isNoticeProfile,
   createNoticeHub,
 } = require('./notice-stream');
@@ -373,7 +375,8 @@ const noticeHub = createNoticeHub({
 });
 const noticePollTimer = setInterval(() => {
   noticeHub.poll().catch((error) => console.error('Notice poll failed:', error.message));
-}, positiveIntervalMs(process.env.NOTICE_POLL_INTERVAL_MS, 5000));
+  // Short enough that a restart notice arrives well inside its few-second grace period.
+}, positiveIntervalMs(process.env.NOTICE_POLL_INTERVAL_MS, 2000));
 noticePollTimer.unref();
 const noticeHeartbeatTimer = setInterval(
   () => noticeHub.heartbeat(),
@@ -412,6 +415,8 @@ app.get('/jcode/session/:sessionId/__jcode/notices', ensureAuthenticated, async 
     const writable = () => !res.writableEnded && !res.destroyed;
     client = {
       key: noticeKeyForProfile(profile),
+      restartKey: restartKeyForProfile(profile),
+      schedule: wantsSchedule(profile),
       profileKey,
       expiresAtMs: Number.parseInt(profile.expiresAt, 10) * 1000,
       write: (chunk) => { if (writable()) res.write(chunk); },
