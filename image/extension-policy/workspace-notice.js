@@ -13,6 +13,7 @@
   if (!sessionPath) return;
 
   const ENDPOINT = `${sessionPath[1]}/__jcode/notices`;
+  // Defaults for Backends that do not send leadMinutes with each transition.
   const LEAD_MINUTES = { DEADLINE: [10, 5, 1], KICKOFF: [1] };
   const AUTO_CLOSE_MS = 15000;
   const CHECK_INTERVAL_MS = 5000;
@@ -21,10 +22,14 @@
   const WARNING_ICON = 'M23.32 17.191L15.438 2.184C14.728.833 13.416 0 11.996 0c-1.42 0-2.733.833-3.443 2.184L.533 17.448a4.744 4.744 0 000 4.368C1.243 23.167 2.555 24 3.975 24h16.05C22.22 24 24 22.044 24 19.632c0-.904-.251-1.746-.68-2.44zm-9.622 1.46c0 1.033-.724 1.823-1.698 1.823s-1.698-.79-1.698-1.822v-.043c0-1.028.724-1.822 1.698-1.822s1.698.79 1.698 1.822v.043zm.039-12.285l-.84 8.06c-.057.581-.408.943-.897.943-.49 0-.84-.367-.896-.942l-.84-8.065c-.057-.624.25-1.095.779-1.095h1.91c.528.005.84.476.784 1.1z';
   const CLOSE_ICON = 'M7.71 8.23l3.75 3.75-1.48 1.48-3.75-3.75-3.75 3.75L1 11.98l3.75-3.75L1 4.48 2.48 3l3.75 3.75L9.98 3l1.48 1.48-3.75 3.75z';
 
+  const MAX_FAILED_CONNECTS = 6;
+
   let transitions = [];
   let offsetMs = 0;
   let container = null;
   const shownInPage = new Set();
+  // Toasts on screen per transition, so a moved or passed transition takes them back.
+  const toastsByTransition = new Map();
 
   const serverNow = () => Date.now() + offsetMs;
 
@@ -91,7 +96,14 @@
     return element;
   }
 
-  function showToast(title, message, autoClose) {
+  function retractToasts(transitionId) {
+    const toasts = toastsByTransition.get(transitionId);
+    if (!toasts) return;
+    toasts.forEach((toast) => toast.remove());
+    toastsByTransition.delete(transitionId);
+  }
+
+  function showToast(transitionId, title, message, autoClose) {
     installStyles();
     if (!container || !container.isConnected) {
       container = document.createElement('div');
@@ -120,7 +132,10 @@
     close.className = 'jcode-notice__close';
     close.setAttribute('aria-label', '닫기');
     close.appendChild(svg('0 0 14 16', CLOSE_ICON));
-    const dismiss = () => toast.remove();
+    const dismiss = () => {
+      toast.remove();
+      toastsByTransition.get(transitionId)?.delete(toast);
+    };
     close.addEventListener('click', dismiss);
 
     toast.append(icon, body, close);
@@ -137,6 +152,8 @@
       toast.appendChild(progress);
     }
     container.prepend(toast);
+    if (!toastsByTransition.has(transitionId)) toastsByTransition.set(transitionId, new Set());
+    toastsByTransition.get(transitionId).add(toast);
   }
 
   function minutesLabel(remainingMs) {
@@ -144,23 +161,34 @@
     return minutes <= 1 ? '1분 이내' : `${minutes}분 후`;
   }
 
+  function leadsFor(transition) {
+    const leads = Array.isArray(transition.leadMinutes)
+      ? transition.leadMinutes.filter((lead) => Number.isInteger(lead) && lead >= 1 && lead <= 60)
+      : [];
+    return leads.length > 0 ? leads : LEAD_MINUTES[transition.kind];
+  }
+
   function notify(transition, lead, remainingMs) {
+    // The last warning before the transition stays until it is dismissed.
+    const autoClose = lead !== Math.min(...leadsFor(transition));
     const when = minutesLabel(remainingMs);
     const name = transition.assignmentName;
     if (transition.kind === 'DEADLINE') {
       const readOnly = transition.readOnlyAfter
-        ? ' 마감 후에는 이 과제를 읽기 전용으로만 볼 수 있습니다.'
+        ? ' 마감 후 이 과제는 읽기 전용으로 바뀝니다.'
         : '';
       showToast(
+        transition.id,
         `"${name}" 과제가 ${when} 마감됩니다`,
-        `마감되면 IDE 연결이 끊기고 환경이 다시 시작됩니다. 작업 중인 파일을 지금 저장하세요.${readOnly} 연결이 끊기면 JCode 포털에서 다시 실행하세요.`,
-        lead > 1
+        `마감되면 이 IDE 연결이 끊깁니다. 작업 중인 파일을 지금 저장하세요.${readOnly} 다른 작업은 JCode 포털에서 다시 실행해 이어갈 수 있습니다.`,
+        autoClose
       );
     } else {
       showToast(
+        transition.id,
         `새 과제 "${name}"이(가) ${when} 시작됩니다`,
-        '과제가 시작되면 IDE 연결이 끊깁니다. 새 과제 폴더를 연결하려고 환경이 다시 시작될 수 있습니다. 작업 중인 파일을 저장하고, 연결이 끊기면 JCode 포털에서 다시 실행하세요.',
-        false
+        '과제가 시작되면 이 IDE 연결이 끊깁니다. 작업 중인 파일을 저장하고, 연결이 끊기면 JCode 포털에서 다시 실행하세요.',
+        autoClose
       );
     }
   }
@@ -173,8 +201,11 @@
     const now = serverNow();
     for (const transition of transitions) {
       const remaining = transition.at - now;
-      if (remaining <= 0) continue;
-      const leads = LEAD_MINUTES[transition.kind] || [];
+      if (remaining <= 0) {
+        retractToasts(transition.id);
+        continue;
+      }
+      const leads = leadsFor(transition) || [];
       const due = leads.filter((lead) => remaining <= lead * 60000);
       if (due.length === 0) continue;
       const lead = Math.min(...due);
@@ -192,25 +223,44 @@
       item && typeof item.id === 'string' && typeof item.assignmentName === 'string' &&
       Number.isFinite(item.at) && LEAD_MINUTES[item.kind]
     ));
+    // A moved deadline arrives as a new id; take back warnings for the old time.
+    const current = new Set(transitions.map((item) => item.id));
+    [...toastsByTransition.keys()].forEach((id) => {
+      if (!current.has(id)) retractToasts(id);
+    });
     check();
   }
 
   let retryMs = 5000;
+  let failedConnects = 0;
+  let connected = false;
+  let stopped = false;
   function connect() {
+    connected = true;
     const source = new EventSource(ENDPOINT, { withCredentials: true });
     source.addEventListener('schedule', (event) => {
       retryMs = 5000;
+      failedConnects = 0;
       try {
         applySchedule(JSON.parse(event.data));
       } catch (_) {
         // Ignore a malformed message; the next update replaces the schedule.
       }
     });
-    source.addEventListener('disabled', () => source.close());
+    source.addEventListener('disabled', () => {
+      stopped = true;
+      source.close();
+    });
     source.addEventListener('error', () => {
       // EventSource retries network errors itself. A failed HTTP response closes
-      // it, so retry with backoff until the session is accepted or disabled.
-      if (source.readyState !== EventSource.CLOSED) return;
+      // it: retry with backoff, then pause (an older Router has no notice stream)
+      // until the page becomes visible again.
+      if (source.readyState !== EventSource.CLOSED || stopped) return;
+      failedConnects += 1;
+      if (failedConnects >= MAX_FAILED_CONNECTS) {
+        connected = false;
+        return;
+      }
       window.setTimeout(connect, retryMs);
       retryMs = Math.min(retryMs * 2, 300000);
     });
@@ -221,7 +271,13 @@
       connect();
       window.setInterval(check, CHECK_INTERVAL_MS);
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') check();
+        if (document.visibilityState !== 'visible') return;
+        check();
+        if (!connected && !stopped) {
+          failedConnects = 0;
+          retryMs = 5000;
+          connect();
+        }
       });
     } catch (error) {
       console.warn('JCode notices unavailable:', error);
