@@ -99,6 +99,13 @@ WORKSPACE_SETTINGS = {
 # editor setting only explain that state; the readOnly volume mount enforces it.
 READ_ONLY_ASSIGNMENT_LABEL_SUFFIX = " (마감)"
 READ_ONLY_SETTING = "files.readonlyInclude"
+# Mounted read-only in place of a closed assignment the student has no directory for
+# (joined late, re-joined, or a legacy finalization moved it). Creating the real
+# assignment directory instead would break reopen/restore and archive decisions.
+READ_ONLY_PLACEHOLDER = "closed-assignment-empty"
+# Where course workspaces mount assignment folders inside the pod. The editor's
+# read-only pattern must use the same path as the volume mounts.
+ASSIGNMENT_MOUNT_ROOT = "/home/coder/project/assignments"
 CODE_SERVER_POLICY = {
     # Actual AI installation enforcement is in the pinned code-server image.
     "AllowedExtensions": {"*": True},
@@ -1024,7 +1031,7 @@ def write_workspace_json(student_dir: Path, filename: str, payload: dict) -> Non
 
 
 def assignment_read_only_pattern(workspace_key: str) -> str:
-    return f"{get_workspace_root().rstrip('/')}/assignments/{workspace_key}/**"
+    return f"{ASSIGNMENT_MOUNT_ROOT}/{workspace_key}/**"
 
 
 def read_only_assignment_label(label: str) -> str:
@@ -1055,6 +1062,34 @@ def read_assignment_descriptor_read_only(student_dir: Path, workspace_key: str) 
         return False
 
 
+READ_ONLY_PLACEHOLDER_README = """# 작업 파일이 없는 과제
+
+이 학생 작업공간에는 이 과제의 마감 시점 파일이 없습니다.
+
+- 마감 후 강의에 등록했거나 다시 등록한 경우, 이전 작업은 보관되어 여기에 표시되지 않습니다.
+- 제출 내용 확인이 필요하면 담당 교수님 또는 조교에게 문의하세요.
+"""
+
+
+def ensure_read_only_placeholder(student_dir: Path) -> None:
+    metadata_dir = student_dir / ".jcode"
+    placeholder = metadata_dir / READ_ONLY_PLACEHOLDER
+    reject_symlink_path(student_dir, metadata_dir)
+    reject_symlink_path(student_dir, placeholder)
+    placeholder.mkdir(parents=True, exist_ok=True)
+    if not placeholder.is_dir():
+        raise HTTPException(status_code=409, detail="읽기 전용 과제 자리표시 경로를 사용할 수 없습니다.")
+    os.chown(metadata_dir, 1000, 1000)
+    os.chown(placeholder, 1000, 1000)
+    # An empty folder reads as lost work; explain why nothing is there.
+    readme = placeholder / "README.md"
+    reject_symlink_path(student_dir, readme)
+    if not readme.exists():
+        readme.write_text(READ_ONLY_PLACEHOLDER_README, encoding="utf-8")
+        os.chown(readme, 1000, 1000)
+        os.chmod(readme, 0o644)
+
+
 def read_assignment_workspace_entries(student_dir: Path) -> list[dict[str, str]]:
     return read_assignment_workspace_folders(student_dir)[0]
 
@@ -1076,7 +1111,7 @@ def read_assignment_workspace_folders(student_dir: Path) -> tuple[list[dict[str,
         workspace_key = descriptor.name.removesuffix(".code-workspace")
         if not re.fullmatch(r"assignment-[1-9][0-9]*", workspace_key):
             continue
-        if not (student_dir / workspace_key).is_dir() or descriptor.is_symlink():
+        if descriptor.is_symlink():
             continue
         try:
             payload = json.loads(descriptor.read_text(encoding="utf-8"))
@@ -1084,8 +1119,12 @@ def read_assignment_workspace_folders(student_dir: Path) -> tuple[list[dict[str,
             label = validate_workspace_display_name(folders[0]["name"], 50)
         except (OSError, json.JSONDecodeError, IndexError, KeyError, TypeError, AttributeError, HTTPException):
             continue
+        read_only = descriptor_marks_read_only(payload, workspace_key)
+        # A closed assignment without a live directory is mounted from the placeholder.
+        if not read_only and not (student_dir / workspace_key).is_dir():
+            continue
         entries.append({"name": label, "path": f"../assignments/{workspace_key}"})
-        if descriptor_marks_read_only(payload, workspace_key):
+        if read_only:
             read_only_keys.append(workspace_key)
     return entries, read_only_keys
 
@@ -1724,6 +1763,8 @@ def create_deployment(
     policy_revision: int = 0, mount_hash: str = "",
     session_kind: str = "STANDARD", read_only_workspace: bool = False,
     read_only_assignment_dirs: Optional[list] = None,
+    empty_read_only_assignment_dirs: Optional[list] = None,
+    assignment_placeholder: bool = False,
 ) -> str:
     init_volume_mounts = []
     isolated_extensions = use_snapshot or session_kind == "INSPECTOR"
@@ -1815,7 +1856,14 @@ def create_deployment(
             if not assignment_workspace_key:
                 raise HTTPException(status_code=400, detail="ASSIGNMENT 범위는 assignment_workspace_key가 필요합니다.")
             workspace_key = validate_assignment_workspace_key(assignment_workspace_key)
-            file_path = f"{file_path.rstrip('/')}/{workspace_key}"
+            if assignment_placeholder:
+                # Never let kubelet create a missing student directory (as root) for a
+                # read-only inspection; that would break a later reopen or restore.
+                if not read_only_workspace:
+                    raise HTTPException(status_code=409, detail="빈 과제 자리표시는 읽기 전용 세션에서만 사용할 수 있습니다.")
+                file_path = f"{file_path.rstrip('/')}/.jcode/{READ_ONLY_PLACEHOLDER}"
+            else:
+                file_path = f"{file_path.rstrip('/')}/{workspace_key}"
         if workspace_scope == "ASSIGNMENT":
             workspace_cmd = "true"
             volume_mount = client.V1VolumeMount(
@@ -1842,7 +1890,7 @@ def create_deployment(
             assignment_mounts = [
                 client.V1VolumeMount(
                     name="jcode-vol",
-                    mount_path=f"/home/coder/project/assignments/{workspace_key}",
+                    mount_path=f"{ASSIGNMENT_MOUNT_ROOT}/{workspace_key}",
                     sub_path=f"{file_path.rstrip('/')}/{workspace_key}",
                 )
                 for workspace_key in [
@@ -1854,12 +1902,22 @@ def create_deployment(
             read_only_assignment_mounts = [
                 client.V1VolumeMount(
                     name="jcode-vol",
-                    mount_path=f"/home/coder/project/assignments/{workspace_key}",
+                    mount_path=f"{ASSIGNMENT_MOUNT_ROOT}/{workspace_key}",
                     sub_path=f"{file_path.rstrip('/')}/{workspace_key}",
                     read_only=True,
                 )
                 for workspace_key in [
                     validate_assignment_workspace_key(value) for value in (read_only_assignment_dirs or [])
+                ]
+            ] + [
+                client.V1VolumeMount(
+                    name="jcode-vol",
+                    mount_path=f"{ASSIGNMENT_MOUNT_ROOT}/{workspace_key}",
+                    sub_path=f"{file_path.rstrip('/')}/.jcode/{READ_ONLY_PLACEHOLDER}",
+                    read_only=True,
+                )
+                for workspace_key in [
+                    validate_assignment_workspace_key(value) for value in (empty_read_only_assignment_dirs or [])
                 ]
             ]
             init_volume_mounts.extend([personal_mount, *assignment_mounts])
@@ -3014,6 +3072,8 @@ async def deploy_resources(
             else student_workspace_lock(f"{class_div}-{request.student_num}")
         )
         mounted_read_only_keys: list[str] = []
+        placeholder_read_only_keys: list[str] = []
+        assignment_placeholder = False
         with lock_context:
             prepare_workspace_extension(request.student_num)
             if not request.use_snapshot and request.workspace_scope == "COURSE":
@@ -3051,6 +3111,9 @@ async def deploy_resources(
                     # legacy final archive from restore/archive and make reopen fail.
                     if assignment_path.is_dir():
                         mounted_read_only_keys.append(workspace_key)
+                    else:
+                        ensure_read_only_placeholder(workspace)
+                        placeholder_read_only_keys.append(workspace_key)
                     write_assignment_workspace_descriptor(
                         workspace,
                         workspace_key,
@@ -3059,6 +3122,16 @@ async def deploy_resources(
                     )
                 remove_stale_assignment_workspace_descriptors(workspace, [*workspace_keys, *read_only_keys])
                 write_general_workspace_descriptor(workspace, request.workspace_display_name)
+            elif request.session_kind == "INSPECTOR":
+                student_dir = get_nfs_workspace_path() / f"{class_div}-{request.student_num}"
+                reject_symlink_path(student_dir.parent, student_dir)
+                if not student_dir.is_dir():
+                    raise HTTPException(status_code=409, detail="학생 작업공간이 없어 과제를 열람할 수 없습니다.")
+                inspected = student_dir / validate_assignment_workspace_key(request.assignment_workspace_key or "")
+                reject_symlink_path(student_dir, inspected)
+                if not inspected.is_dir():
+                    ensure_read_only_placeholder(student_dir)
+                    assignment_placeholder = True
             ensure_code_server_config(core_v1_api, namespace)
 
             deployment_msg = create_deployment(
@@ -3084,6 +3157,8 @@ async def deploy_resources(
                 request.session_kind,
                 request.read_only_workspace,
                 mounted_read_only_keys,
+                placeholder_read_only_keys,
+                assignment_placeholder,
             )
             service_msg = create_service(
                 core_v1_api,
@@ -3569,7 +3644,7 @@ def move_assignment_between_workspace_and_final_archive(
                         status_code=409,
                         detail=f"최종본 없이 Workspace만 남아 있습니다: {student_dir.name}",
                     )
-                if not retain_descriptors:
+                if not retain_descriptors and not read_assignment_descriptor_read_only(student_dir, workspace_key):
                     remove_assignment_workspace_descriptor(student_dir, workspace_key)
                 continue
             if restore:
@@ -3597,10 +3672,12 @@ def move_assignment_between_workspace_and_final_archive(
                 },
             )
             if not copied:
-                if not retain_descriptors:
+                if not retain_descriptors and not read_assignment_descriptor_read_only(student_dir, workspace_key):
                     remove_assignment_workspace_descriptor(student_dir, workspace_key)
                 continue
-        if not restore and not retain_descriptors:
+        # A read-only descriptor was written by a policy deploy that keeps this closed
+        # assignment visible; only that reconciler may remove it.
+        if not restore and not retain_descriptors and not read_assignment_descriptor_read_only(student_dir, workspace_key):
             remove_assignment_workspace_descriptor(student_dir, workspace_key)
         moved += 1
     return moved

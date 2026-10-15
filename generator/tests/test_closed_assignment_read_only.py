@@ -64,11 +64,15 @@ def test_closed_assignment_is_mounted_read_only_without_creating_missing_directo
     asyncio.run(generator.deploy_resources(deploy_request(generator), token_payload={}))
 
     args = deploy_env.captured["args"]
-    # assignment_dirs stays writable-only; only existing closed directories are mounted read-only.
+    # assignment_dirs stays writable-only; closed directories are mounted read-only and a
+    # missing one is replaced by the empty placeholder instead of being created.
     assert args[10] == ["assignment-9"]
-    assert args[-1] == ["assignment-7"]
+    assert args[-3] == ["assignment-7"]
+    assert args[-2] == ["assignment-8"]
+    assert args[-1] is False
     assert (deploy_env.student / "assignment-9").is_dir()
     assert not (deploy_env.student / "assignment-8").exists()
+    assert (deploy_env.student / ".jcode" / "closed-assignment-empty").is_dir()
     assert (deploy_env.student / "assignment-7" / "answer.py").read_text(encoding="utf-8") == "print(1)"
 
     metadata = deploy_env.student / ".jcode"
@@ -85,9 +89,13 @@ def test_closed_assignment_is_mounted_read_only_without_creating_missing_directo
     assert general["folders"] == [
         {"name": "내 작업공간", "path": "../workspace"},
         {"name": "첫 과제 (마감)", "path": "../assignments/assignment-7"},
+        {"name": "둘째 과제 (마감)", "path": "../assignments/assignment-8"},
         {"name": "진행 과제", "path": "../assignments/assignment-9"},
     ]
-    assert general["settings"]["files.readonlyInclude"] == {READ_ONLY_PATTERN.format("assignment-7"): True}
+    assert general["settings"]["files.readonlyInclude"] == {
+        READ_ONLY_PATTERN.format("assignment-7"): True,
+        READ_ONLY_PATTERN.format("assignment-8"): True,
+    }
 
 
 def test_reopened_assignment_becomes_writable_again(generator, deploy_env):
@@ -106,7 +114,10 @@ def test_reopened_assignment_becomes_writable_again(generator, deploy_env):
     assert not (metadata / "assignment-8.code-workspace").exists()
     general = json.loads((metadata / "홍길동의 JCode.code-workspace").read_text(encoding="utf-8"))
     assert "files.readonlyInclude" not in general["settings"]
-    assert deploy_env.captured["args"][-1] == []
+    assert [folder["path"] for folder in general["folders"]] == [
+        "../workspace", "../assignments/assignment-7", "../assignments/assignment-9",
+    ]
+    assert deploy_env.captured["args"][-3:] == ([], [], False)
 
 
 @pytest.mark.parametrize(
@@ -189,8 +200,15 @@ def test_finalization_can_retain_closed_assignment_descriptors(generator, monkey
     assert (student / ".jcode" / "assignment-7.code-workspace").is_file()
     assert (tmp_path / "archive" / "final" / "os-1" / "assignment-7" / "1" / student.name / "answer.py").is_file()
 
+    # Even a Backend that does not ask to retain must not drop a read-only descriptor.
     generator.move_assignment_between_workspace_and_final_archive(
         "jcode-os-1", "assignment-7", 90, restore=False, finalization_generation=2
+    )
+    assert (student / ".jcode" / "assignment-7.code-workspace").is_file()
+
+    generator.write_assignment_workspace_descriptor(student, "assignment-7", "첫 과제", read_only=False)
+    generator.move_assignment_between_workspace_and_final_archive(
+        "jcode-os-1", "assignment-7", 90, restore=False, finalization_generation=3
     )
     assert not (student / ".jcode" / "assignment-7.code-workspace").exists()
 
@@ -237,6 +255,7 @@ def test_read_only_assignment_mounts_are_not_given_to_init_container(generator, 
         False,
         assignment_dirs=["assignment-9"],
         read_only_assignment_dirs=["assignment-7"],
+        empty_read_only_assignment_dirs=["assignment-8"],
     )
 
     pod_spec = apps.deployment.spec.template.spec
@@ -248,6 +267,73 @@ def test_read_only_assignment_mounts_are_not_given_to_init_container(generator, 
     assert runtime_mounts["/home/coder/project/assignments/assignment-7"].read_only is True
     assert runtime_mounts["/home/coder/project/assignments/assignment-7"].sub_path == "workspace/alg-1-20260001/assignment-7"
     assert not runtime_mounts["/home/coder/project/assignments/assignment-9"].read_only
+    placeholder = runtime_mounts["/home/coder/project/assignments/assignment-8"]
+    assert placeholder.read_only is True
+    assert placeholder.sub_path == "workspace/alg-1-20260001/.jcode/closed-assignment-empty"
     init_paths = {mount.mount_path for mount in pod_spec.init_containers[0].volume_mounts}
     assert "/home/coder/project/assignments/assignment-7" not in init_paths
+    assert "/home/coder/project/assignments/assignment-8" not in init_paths
     assert "/home/coder/project/assignments/assignment-9" in init_paths
+
+
+def test_read_only_editor_pattern_follows_the_mount_path(generator, monkeypatch, tmp_path):
+    student = tmp_path / "workspace" / "os-1-20260001"
+    (student / "assignment-7").mkdir(parents=True)
+    monkeypatch.setattr(os, "chown", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("WORKSPACE_ROOT", "/home/coder/project/course")
+
+    generator.write_assignment_workspace_descriptor(student, "assignment-7", "첫 과제", read_only=True)
+
+    descriptor = json.loads((student / ".jcode" / "assignment-7.code-workspace").read_text(encoding="utf-8"))
+    assert descriptor["settings"]["files.readonlyInclude"] == {
+        f"{generator.ASSIGNMENT_MOUNT_ROOT}/assignment-7/**": True
+    }
+
+
+def test_empty_placeholder_explains_why_it_is_empty(generator, deploy_env):
+    asyncio.run(generator.deploy_resources(deploy_request(generator), token_payload={}))
+
+    readme = deploy_env.student / ".jcode" / "closed-assignment-empty" / "README.md"
+    assert "마감 시점 파일이 없습니다" in readme.read_text(encoding="utf-8")
+
+
+def test_inspector_never_lets_kubelet_create_a_missing_student_directory(generator, deploy_env):
+    inspector = dict(
+        session_kind="INSPECTOR", workspace_scope="ASSIGNMENT", read_only_workspace=True,
+        assignment_workspace_key="assignment-8", assignment_dirs=["assignment-8"],
+        read_only_assignment_dirs=[], assignment_labels={},
+    )
+    asyncio.run(generator.deploy_resources(deploy_request(generator, **inspector), token_payload={}))
+    assert deploy_env.captured["args"][-1] is True
+    assert not (deploy_env.student / "assignment-8").exists()
+
+    asyncio.run(generator.deploy_resources(
+        deploy_request(generator, **{**inspector, "assignment_workspace_key": "assignment-7", "assignment_dirs": ["assignment-7"]}),
+        token_payload={},
+    ))
+    assert deploy_env.captured["args"][-1] is False
+
+
+def test_inspector_placeholder_mount_is_read_only(generator, monkeypatch):
+    class AppsV1:
+        def create_namespaced_deployment(self, namespace, body):
+            self.deployment = body
+
+    monkeypatch.setattr(generator, "get_requested_workspace_image", lambda *_: "harbor/image@sha256:" + "a" * 64)
+    monkeypatch.setattr(generator, "get_workspace_init_image", lambda: "harbor/init@sha256:" + "b" * 64)
+    monkeypatch.setattr(generator, "get_workspace_resources", lambda *_: generator.client.V1ResourceRequirements())
+    monkeypatch.setattr(generator, "get_image_pull_secret_names", lambda: [])
+    apps = AppsV1()
+    generator.create_deployment(
+        apps, "jcode-alg-1", "jinspect-1", "jinspect-1", "workspace/alg-1-20260001", "20260001", False, False,
+        workspace_scope="ASSIGNMENT", assignment_workspace_key="assignment-8", session_kind="INSPECTOR",
+        read_only_workspace=True, assignment_placeholder=True,
+    )
+    mount = next(m for m in apps.deployment.spec.template.spec.containers[0].volume_mounts if m.mount_path == "/home/coder/project")
+    assert mount.sub_path == "workspace/alg-1-20260001/.jcode/closed-assignment-empty"
+    assert mount.read_only is True
+    with pytest.raises(HTTPException):
+        generator.create_deployment(
+            apps, "jcode-alg-1", "jcode-1", "jcode-1", "workspace/alg-1-20260001", "20260001", False, False,
+            workspace_scope="ASSIGNMENT", assignment_workspace_key="assignment-8", assignment_placeholder=True,
+        )
