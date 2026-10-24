@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 리소스마다 namespace를 직접 적는다 (monitoring, ingress-nginx가 섞여 있다).
+resources:
+  - prometheus/monitors.yaml
+  - prometheus/ingress-nginx-metrics-service.yaml
+  - grafana/grafana.yaml
+
+configMapGenerator:
+  - name: grafana-provisioning-datasources
+    namespace: monitoring
+    files:
+      - datasources.yaml=grafana/provisioning/datasources.yaml
+  - name: grafana-provisioning-dashboards
+    namespace: monitoring
+    files:
+      - dashboards.yaml=grafana/provisioning/dashboards.yaml
+  - name: grafana-dashboards
+    namespace: monitoring
+    files:
+      - jcode-overview.json=dashboards/jcode-overview.json

@@ -1,0 +1,54 @@
+# kube-prometheus-stack(release=prometheus)이 읽는 추가 수집 대상
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: longhorn-prometheus-servicemonitor
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames: [longhorn-system]
+  selector:
+    matchLabels:
+      app: longhorn-manager
+  endpoints:
+    - port: manager
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: watcher-postgres
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames: [watcher]
+  selector:
+    matchLabels:
+      cnpg.io/cluster: watcher-postgres
+      cnpg.io/podRole: instance
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 30s
+---
+# ingress-nginx DaemonSet에 --enable-metrics=true와 metrics(10254) 포트가 있어야 한다.
+# DaemonSet은 이 디렉터리에서 관리하지 않는다 (README 참고).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ingress-nginx-controller
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames: [ingress-nginx]
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: controller-metrics
+  endpoints:
+    - port: metrics
+      interval: 30s
