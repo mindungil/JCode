@@ -6,6 +6,7 @@ resources:
   - prometheus/monitors.yaml
   - prometheus/ingress-nginx-metrics-service.yaml
   - prometheus/mariadb-exporter.yaml
+  - prometheus/generator-metrics-networkpolicy.yaml
   - grafana/grafana.yaml
 
 configMapGenerator:
@@ -21,3 +22,7 @@ configMapGenerator:
     namespace: monitoring
     files:
       - jcode-overview.json=dashboards/jcode-overview.json
+      - jcode-ide.json=dashboards/jcode-ide.json
+      - jcode-storage.json=dashboards/jcode-storage.json
+      - jcode-db.json=dashboards/jcode-db.json
+      - jcode-cluster.json=dashboards/jcode-cluster.json

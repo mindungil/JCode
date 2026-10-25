@@ -1,0 +1,24 @@
+# generator는 jcode-workspace-backend-only 정책으로 backend만 받는다.
+# Prometheus 파드 하나만 generator 포트(5000)에 들어올 수 있게 더한다. 다른 파드·네임스페이스는 그대로 막힌다.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jcode-generator-allow-prometheus
+  namespace: watcher
+spec:
+  podSelector:
+    matchLabels:
+      app: jcode-generator
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+              operator.prometheus.io/name: prometheus-kube-prometheus-prometheus
+      ports:
+        - port: 5000
+          protocol: TCP

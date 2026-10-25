@@ -15,6 +15,11 @@ spec:
   endpoints:
     - port: manager
       interval: 30s
+      # longhorn-manager 내부 REST 클라이언트 지표(약 2.5만 개)는 운영에 쓰지 않아 버린다
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: longhorn_rest_client_.*
+          action: drop
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
