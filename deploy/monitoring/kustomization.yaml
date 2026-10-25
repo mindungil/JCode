@@ -5,6 +5,7 @@ kind: Kustomization
 resources:
   - prometheus/monitors.yaml
   - prometheus/ingress-nginx-metrics-service.yaml
+  - prometheus/mariadb-exporter.yaml
   - grafana/grafana.yaml
 
 configMapGenerator:

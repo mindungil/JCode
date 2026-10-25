@@ -3,7 +3,7 @@
 kube-prometheus-stack(helm release `prometheus`, namespace `monitoring`)은 이 디렉터리 밖에서 설치되어 있습니다.
 여기에는 그 위에 얹는 것만 있습니다.
 
-- `prometheus/`: 추가 수집 대상. Longhorn ServiceMonitor, `watcher-postgres` PodMonitor, ingress-nginx 메트릭 Service·ServiceMonitor
+- `prometheus/`: 추가 수집 대상. Longhorn ServiceMonitor, `watcher-postgres` PodMonitor, ingress-nginx 메트릭 Service·ServiceMonitor, MariaDB exporter
 - `grafana/`: Grafana Deployment·PVC·Service·Ingress와 provisioning(데이터소스, 대시보드 목록)
 - `dashboards/`: 대시보드 JSON. Grafana가 `JCode` 폴더로 읽습니다
 
@@ -12,12 +12,14 @@ Grafana 주소는 `https://jcode.jedutools.io/grafana/`입니다. ingress는 `/g
 
 ## 처음 적용
 
-관리자 계정 Secret을 먼저 만듭니다. 비밀번호는 저장소에 넣지 않습니다.
+관리자 계정 Secret과 MariaDB exporter 접속 Secret을 먼저 만듭니다. 비밀번호는 저장소에 넣지 않습니다.
+MariaDB에는 읽기 전용 계정 `'exporter'@'10.0.0.%'`(PROCESS, BINLOG MONITOR, SLAVE MONITOR, `performance_schema` SELECT, 최대 연결 3)이 있어야 합니다.
 
 ```bash
 kubectl -n monitoring create secret generic grafana-admin \
   --from-literal=admin-user=admin \
   --from-literal=admin-password="$(openssl rand -base64 24)"
+kubectl -n monitoring create secret generic mariadb-exporter --from-file=.my.cnf=<user·password·host=10.0.0.234가 든 my.cnf>
 kubectl apply -k deploy/monitoring
 ```
 

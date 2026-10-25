@@ -1,0 +1,93 @@
+# JCode MariaDB(10.0.0.234, 클러스터 밖) 서버 상태 수집
+# 접속 정보는 Secret mariadb-exporter(.my.cnf)로 넣는다. 저장소에 넣지 않는다.
+# DB 계정: 'exporter'@'10.0.0.%' — PROCESS, BINLOG MONITOR, SLAVE MONITOR, performance_schema SELECT, 최대 연결 3
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mariadb-exporter
+    app.kubernetes.io/part-of: jcode-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mariadb-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mariadb-exporter
+        app.kubernetes.io/part-of: jcode-monitoring
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: exporter
+          # v0.20.0 (2026-08-13)
+          image: prom/mysqld-exporter:v0.20.0@sha256:abed8dac117b4ae5b70757f988e44795935b9a72c3b58d720c67ba688f8cb79e
+          args:
+            - --config.my-cnf=/etc/mysqld-exporter/.my.cnf
+            - --mysqld.address=10.0.0.234:3306
+            - --collect.info_schema.processlist
+          ports:
+            - name: metrics
+              containerPort: 9104
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: metrics
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: my-cnf
+              mountPath: /etc/mysqld-exporter
+              readOnly: true
+      volumes:
+        - name: my-cnf
+          secret:
+            secretName: mariadb-exporter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mariadb-exporter
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mariadb-exporter
+  ports:
+    - name: metrics
+      port: 9104
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mariadb-exporter
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mariadb-exporter
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
