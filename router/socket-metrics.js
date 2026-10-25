@@ -14,7 +14,8 @@ function socketMetricLabels(profile = {}) {
     courseCode: String(profile.courseCode || 'unknown'),
     clss: String(profile.clss || 'unknown'),
     kind: sessionKind(profile),
-    user: profile.email ? String(profile.email) : null,
+    // 조회(inspector) 세션은 보는 사람(viewerEmail)을 센다. 본인 세션은 viewerEmail과 email이 같다.
+    user: profile.viewerEmail || profile.email ? String(profile.viewerEmail || profile.email) : null,
   };
 }
 

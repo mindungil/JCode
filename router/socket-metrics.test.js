@@ -21,6 +21,7 @@ test('keeps email out of labels but uses it for distinct users', () => {
   const labels = socketMetricLabels({ courseCode: '64', clss: '1', email: 'a@jbnu.ac.kr' });
   assert.deepEqual(labels, { courseCode: '64', clss: '1', kind: 'standard', user: 'a@jbnu.ac.kr' });
   assert.deepEqual(socketMetricLabels({}), { courseCode: 'unknown', clss: 'unknown', kind: 'standard', user: null });
+  assert.equal(socketMetricLabels({ courseCode: '64', clss: '1', email: 's@x', viewerEmail: 'prof@x', mode: 'INSPECTOR' }).user, 'prof@x');
 });
 
 test('counts sockets and distinct users per course, class and kind', () => {
@@ -30,7 +31,8 @@ test('counts sockets and distinct users per course, class and kind', () => {
     s({ courseCode: '64', clss: '1', email: 'a@x' }),
     s({ courseCode: '64', clss: '1', email: 'b@x' }),
     s({ courseCode: '64', clss: '2', email: 'a@x' }),
-    s({ courseCode: '64', clss: '1', email: 'p@x', mode: 'INSPECTOR' }),
+    s({ courseCode: '64', clss: '1', email: 'a@x', viewerEmail: 'p@x', mode: 'INSPECTOR' }),
+    s({ courseCode: '64', clss: '1', email: 'b@x', viewerEmail: 'p@x', mode: 'INSPECTOR' }),
     {},
     null,
   ]);
@@ -38,7 +40,7 @@ test('counts sockets and distinct users per course, class and kind', () => {
   assert.equal(result.length, 3);
   assert.deepEqual(byKey['64/1/standard'], { labels: { course_code: '64', clss: '1', kind: 'standard' }, sockets: 3, users: 2 });
   assert.deepEqual(byKey['64/2/standard'], { labels: { course_code: '64', clss: '2', kind: 'standard' }, sockets: 1, users: 1 });
-  assert.deepEqual(byKey['64/1/inspector'], { labels: { course_code: '64', clss: '1', kind: 'inspector' }, sockets: 1, users: 1 });
+  assert.deepEqual(byKey['64/1/inspector'], { labels: { course_code: '64', clss: '1', kind: 'inspector' }, sockets: 2, users: 1 });
 });
 
 test('returns nothing when no sockets are open', () => {
