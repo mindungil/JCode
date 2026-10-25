@@ -26,6 +26,7 @@ const {
   isNoticeProfile,
   createNoticeHub,
 } = require('./notice-stream');
+const { socketMetricLabels, summarizeSockets, openSessions } = require('./socket-metrics');
 require('dotenv').config();
 
 const app = express();
@@ -467,6 +468,32 @@ const server = app.listen(port, () => {
 });
 
 const activeSockets = new Map();
+
+// 열린 IDE WebSocket 수와 사용자 수. 스크레이프할 때 activeSockets에서 바로 센다.
+const socketLabelNames = ['course_code', 'clss', 'kind'];
+new client.Gauge({
+  name: 'jcode_router_websocket_connections',
+  help: 'Open IDE WebSocket connections on this router',
+  labelNames: socketLabelNames,
+  collect() {
+    this.reset();
+    for (const group of summarizeSockets(openSessions(activeSockets))) {
+      this.set(group.labels, group.sockets);
+    }
+  },
+});
+new client.Gauge({
+  name: 'jcode_router_websocket_users',
+  help: 'Users with at least one open IDE WebSocket on this router',
+  labelNames: socketLabelNames,
+  collect() {
+    this.reset();
+    for (const group of summarizeSockets(openSessions(activeSockets))) {
+      this.set(group.labels, group.users);
+    }
+  },
+});
+
 function removeActiveSocket(socket) {
   const session = activeSockets.get(socket);
   if (session?.expiryTimer) clearTimeout(session.expiryTimer);
@@ -581,6 +608,7 @@ server.on('upgrade', async (req, socket, head) => {
       routeKey: redisKeyForTarget,
       decoded,
       expiryTimer,
+      metrics: socketMetricLabels(userProfile),
     });
     const removeSocket = () => removeActiveSocket(socket);
     socket.once('close', removeSocket);
