@@ -34,7 +34,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 3,
         "x": 0,
         "y": 0
       },
@@ -112,8 +112,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
+        "w": 3,
+        "x": 3,
         "y": 0
       },
       "targets": [
@@ -175,8 +175,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
+        "w": 3,
+        "x": 6,
         "y": 0
       },
       "targets": [
@@ -246,8 +246,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
+        "w": 3,
+        "x": 9,
         "y": 0
       },
       "targets": [
@@ -309,8 +309,70 @@
     {
       "type": "stat",
       "id": 5,
+      "title": "접속 중인 학생",
+      "description": "IDE 웹소켓이 열려 있는 사용자 수 (router 파드별 합계라 한 사람이 두 router에 붙으면 2로 셀 수 있음, 교수 조회 제외)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(jcode_router_websocket_users{kind!=\"inspector\"}) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "id": 6,
       "title": "실행 중인 IDE",
-      "description": "운영 강의 네임스페이스(jcode-*)에서 Running인 파드 수",
+      "description": "운영 강의 네임스페이스(jcode-*)에서 Running인 파드 수. 떠 있기만 하고 안 쓰는 IDE도 포함",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -370,7 +432,7 @@
     },
     {
       "type": "stat",
-      "id": 6,
+      "id": 7,
       "title": "볼륨 이상",
       "description": "Longhorn 볼륨 중 degraded(2)·faulted(3) 수. 2026-10 기준 옛 redis 볼륨 pvc-a09ddfe4 1개는 알고 두는 것",
       "datasource": {
@@ -436,7 +498,7 @@
     },
     {
       "type": "timeseries",
-      "id": 7,
+      "id": 8,
       "title": "도메인별 요청/초",
       "description": "ingress host별 요청 수 (헬스체크 제외)",
       "datasource": {
@@ -497,7 +559,7 @@
     },
     {
       "type": "timeseries",
-      "id": 8,
+      "id": 9,
       "title": "응답코드별 요청/초",
       "description": "2xx 정상, 3xx 이동, 4xx 요청 오류, 5xx 서버 오류",
       "datasource": {
@@ -619,9 +681,9 @@
     },
     {
       "type": "timeseries",
-      "id": 9,
-      "title": "backend API 평균 응답시간 · 5xx",
-      "description": "jcode-backend /api 요청. 평균 응답시간(왼쪽 축)과 5xx 발생 수(오른쪽 축)",
+      "id": 10,
+      "title": "backend API 응답시간 p95 · 5xx",
+      "description": "jcode-backend /api 요청. p95 응답시간(왼쪽 축)과 5xx 발생 수(오른쪽 축). histogram은 2026-10-25부터",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -638,8 +700,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(http_server_requests_seconds_sum{job=\"jcode-backend\",uri=~\"/api/.*\"}[5m])) / sum(rate(http_server_requests_seconds_count{job=\"jcode-backend\",uri=~\"/api/.*\"}[5m]))",
-          "legendFormat": "평균 응답시간",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{job=\"jcode-backend\",uri=~\"/api/.*\"}[5m])))",
+          "legendFormat": "p95 응답시간",
           "refId": "A"
         },
         {
@@ -713,9 +775,9 @@
     },
     {
       "type": "timeseries",
-      "id": 10,
+      "id": 11,
       "title": "강의별 실행 중 IDE",
-      "description": "강의 네임스페이스별 Running 파드 수 (네임스페이스 이름 → 강의명 연결은 추후)",
+      "description": "강의별 Running IDE 파드 수. 이름은 네임스페이스 annotation jcode.io/display-name",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -732,8 +794,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count by (namespace) (kube_pod_status_phase{namespace=~\"jcode-.*\",namespace!~\"jcode-dev-.*\",phase=\"Running\"} == 1)",
-          "legendFormat": "{{namespace}}",
+          "expr": "count by (namespace) (kube_pod_status_phase{namespace=~\"jcode-.*\",namespace!~\"jcode-dev-.*\",phase=\"Running\"} == 1) * on (namespace) group_left (annotation_jcode_io_display_name) max by (namespace, annotation_jcode_io_display_name) (kube_namespace_annotations)",
+          "legendFormat": "{{annotation_jcode_io_display_name}}",
           "refId": "A"
         }
       ],
@@ -774,7 +836,7 @@
     },
     {
       "type": "table",
-      "id": 11,
+      "id": 12,
       "title": "최근 1시간 오류 많은 API (401 제외)",
       "description": "jcode-backend에서 4xx(401 제외)·5xx가 난 URI 상위 10개",
       "datasource": {

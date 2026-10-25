@@ -32,6 +32,12 @@ DaemonSet은 이 디렉터리에서 관리하지 않으므로 바꿀 때 따로 
 
 새 대시보드는 `dashboards/`에 JSON을 추가하고 `kustomization.yaml`의 `grafana-dashboards` 목록에 넣습니다.
 
+## 이 디렉터리 밖에서 함께 바꾼 것 (2026-10-25)
+
+- kube-prometheus-stack helm 값: `kube-state-metrics.metricAnnotationsAllowList`에 `namespaces=[jcode.io/display-name,jcode.io/course-name,jcode.io/course-id]` → 강의명 표시
+- `deploy/production-state/configmaps.yaml`의 `jcode-backend-config`: backend `http.server.requests` histogram(5ms~10s) → p95
+- router: `jcode_router_websocket_connections`, `jcode_router_websocket_users` (브랜치 `feat/router-socket-metrics`)
+
 ## 아직 없는 것
 
 - Keycloak 로그인: `key.jedutools.io` realm `JEduTools`의 `grafana` 클라이언트가 비활성 상태라 지금은 관리자 계정만 씁니다
